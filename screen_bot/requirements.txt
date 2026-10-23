@@ -1,0 +1,8 @@
+keyboard>=0.13.5
+pyperclip>=1.11.0
+google-genai>=2.32.0
+pillow>=10.0.0
+python-dotenv>=1.0.0
+pystray>=0.19.5
+mss>=9.0.1
+pynput>=1.7.6
