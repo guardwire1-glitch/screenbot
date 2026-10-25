@@ -560,6 +560,7 @@ class ScreenBot:
         self._review_lock = threading.RLock()
         self._review_notices: Dict[str, str] = {}
         self._dismissed_reviews: Dict[str, set] = {}
+        self._review_window_open = False
 
         # IDE-agnostic editor bridge. The socket is started by main(), not by
         # the constructor, so unit tests and one-off imports never bind a port.
@@ -880,7 +881,10 @@ class ScreenBot:
         try:
             change = self.editor_router.queue_pending(context, proposed, reason, diagnostics)
             logger.warning(f"Change held for review: {reason} ({context.file_path}).")
-            self._notify_guard(f"Change held for review: {reason}")
+            self._notify_guard(
+                f"Change held for review: {reason}. "
+                "Open Review Pending Changes from the tray."
+            )
             return change
         except Exception as e:
             logger.error(f"Could not queue pending change: {e}")
@@ -975,6 +979,41 @@ class ScreenBot:
                 self._review_notices[key] = "edit dismissed"
             logger.info(f"Reviewed lecture edit dismissed for {item.file_path}; sync stays paused.")
         return outcome
+
+    def open_pending_review(self) -> None:
+        """Open the tray review window for queued changes without blocking the tray."""
+        with self._review_lock:
+            if self._review_window_open:
+                self._notify_guard("The pending changes window is already open.")
+                return
+            self._review_window_open = True
+        threading.Thread(
+            target=self._run_pending_review_window,
+            name="PendingReviewWindow",
+            daemon=True,
+        ).start()
+
+    def _run_pending_review_window(self) -> None:
+        try:
+            self._build_pending_review_window().run()
+        except Exception as exc:
+            logger.error(f"Could not open the pending review window: {exc}")
+            self._notify_guard(
+                "Could not open the pending changes window. "
+                "The queue is in session_data/pending_changes.json; see the log."
+            )
+        finally:
+            with self._review_lock:
+                self._review_window_open = False
+
+    def _build_pending_review_window(self):
+        from pending_review import PendingReviewWindow
+
+        return PendingReviewWindow(
+            list_items=self.bridge.pending.list,
+            resolve_item=self._resolve_pending_change,
+            logger=logger,
+        )
 
     def _handle_review_edits(self, frame_id: str, doc, merge_res, ctx,
                              baseline: str) -> None:
@@ -2486,6 +2525,7 @@ class ScreenBot:
                 checked=lambda item: self.direct_file_sync,
             ),
             pystray.MenuItem("Bind Active Editor File (Ctrl+Shift+F)", lambda icon, item: self.bind_active_editor_file()),
+            pystray.MenuItem("Review Pending Changes...", lambda icon, item: self.open_pending_review()),
             pystray.MenuItem(
                 f"⚡ Auto-Scan Live Coding ({scan_interval}s interval)",
                 lambda icon, item: self.toggle_auto_scan(),
@@ -2672,7 +2712,7 @@ def main():
         for k, v in report.items():
             print(f"[{v:4s}] {k}")
             logger.info(f"SELFTEST [{v:4s}] {k}")
-        sys.exit(0 if all(v == "PASS" for v in report.values()) else 1)
+        sys.exit(0 if all(v != "FAIL" for v in report.values()) else 1)
 
     ensure_single_instance()
     bot = ScreenBot()

@@ -179,8 +179,8 @@ ScreenBot starts a localhost-only bridge while it runs and writes
 %APPDATA%\ScreenBot\bridge.json (token-protected). Every request must send
 the token in the X-ScreenBot-Token header; a token in the URL is rejected.
 The optional extension in ide_extension/vscode supplies the exact buffer,
-diagnostics, hash-checked applies, and the pending-change review UI to
-VS Code, Antigravity, Cursor, and Windsurf.
+diagnostics, and hash-checked applies to VS Code, Antigravity, Cursor,
+and Windsurf.
 
 Install it by copying ide_extension/vscode to:
   %USERPROFILE%\.vscode\extensions\screenbot.screenbot-editor-bridge-1.0.0
@@ -189,6 +189,12 @@ then restart the editor. The status bar shows "ScreenBot: bridge
 connected". Command palette commands:
   - ScreenBot: Show Bridge Status
   - ScreenBot: Review Pending Code Changes
+
+Pending changes can be reviewed without the extension: right-click the
+tray icon and choose "Review Pending Changes...". That window lists every
+queued change and can accept or dismiss it by path; this is the review
+path for JetBrains, Eclipse, NetBeans, SSMS, Notepad++, and any other
+editor.
 
 Without the extension, VS Code-family editors fall back to the disk
 adapter (saved files only) if used via target_file_path. The extension's
@@ -204,6 +210,7 @@ TRAY MENU CONTROLS (Right-click the monitor icon by the clock):
 - Force Full Re-Sync (Ctrl+Shift+\)
 - [toggle] Direct File Sync (Zero Keystrokes)
 - Bind Active Editor File (Ctrl+Shift+F)
+- Review Pending Changes...
 - [toggle] Auto-Scan Live Coding (5s interval)
 - Lecture Note-Taker / Slides (Ctrl+4)
 - Emergency Stop Typing (ESC)
@@ -240,9 +247,10 @@ TROUBLESHOOTING:
   a new line must appear on two consecutive scans, and the bottom line is
   held longer while it is being typed (an incomplete line is held until
   it is finished). Press Ctrl + \ to bypass the hold and sync now.
-- "A change was held for review" -> VS Code family: run
-  "ScreenBot: Review Pending Code Changes" (it can also resolve an item
-  for another editor by path). Reasons include an unsaved buffer, saved
+- "A change was held for review" -> Right-click the tray icon and choose
+  "Review Pending Changes...", or in the VS Code family run
+  "ScreenBot: Review Pending Code Changes" (both resolve an item for any
+  editor by path). Reasons include an unsaved buffer, saved
   state that could not be verified, a hash conflict, a line you removed,
   a syntax failure, or worsening diagnostics. The same change is queued
   once, not every scan. For disk-based editors, save/reload after
@@ -260,5 +268,8 @@ TROUBLESHOOTING:
   want cue beeps. The separate status icon is not a timed popup.
 - Wrong language written -> Set "subject": "auto" in config.json, or pick
   a language in tray -> Subject Preset. The follower never translates.
+- Self-test FAIL on tree_sitter_grammars, win32_com, or
+  review_window_toolkit -> The frozen exe is missing a bundled component.
+  Re-extract the release archive, or rebuild with ScreenBot.spec.
 - "running directly from ZIP" -> Extract the archive first.
 =======================================================================

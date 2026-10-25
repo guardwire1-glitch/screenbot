@@ -12,7 +12,8 @@
   "activationEvents": ["onStartupFinished"],
   "main": "./extension.js",
   "scripts": {
-    "test": "node --test test/extension.test.js"
+    "test": "node --test test/extension.test.js",
+    "package": "npx -y @vscode/vsce package"
   },
   "contributes": {
     "commands": [

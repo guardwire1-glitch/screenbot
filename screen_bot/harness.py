@@ -8,7 +8,8 @@ Testing & Replay Harness (Pipeline Stage 10):
   * Legitimate repeated lines are not dropped.
   * No sentinel or placeholder text is ever injected into master.
 - Fuzz Testing: runs simulated sessions verifying 0 deleted, duplicated, or invented lines.
-- Self-test Flag: checks capture, hotkeys, API reachability, clipboard, and write access.
+- Self-test Flag: checks capture, hotkeys, API reachability, clipboard, write access,
+  tree-sitter grammars, COM automation, and the review-window toolkit.
 """
 
 import io
@@ -209,5 +210,49 @@ def run_selftest(check_api: bool = False, api_key: str = "") -> Dict[str, str]:
             results["gemini_api_reachability"] = "FAIL"
     else:
         results["gemini_api_reachability"] = "SKIPPED"
+
+    # 6. Syntax gate: all grammars are dynamically imported, so a frozen build
+    # can silently fall back to the delimiter scanner without this check.
+    try:
+        try:
+            from screen_bot.syntax_gate import AVAILABLE_GRAMMARS, check
+        except ModuleNotFoundError:
+            from syntax_gate import AVAILABLE_GRAMMARS, check
+        wanted = {"csharp", "java", "python"}
+        probes = {
+            "csharp": "class Probe { int x = 1; }",
+            "java": "class Probe { int x = 1; }",
+            "python": "x = 1",
+        }
+        parsed = all(
+            check(source, language).parser == "tree-sitter"
+            for language, source in probes.items()
+        )
+        results["tree_sitter_grammars"] = (
+            "PASS" if wanted <= set(AVAILABLE_GRAMMARS) and parsed else "FAIL"
+        )
+    except Exception:
+        results["tree_sitter_grammars"] = "FAIL"
+
+    # 7. COM automation used by the Visual Studio adapter (pywin32).
+    try:
+        import pythoncom
+        import win32com.client  # noqa: F401
+        pythoncom.CoInitialize()
+        pythoncom.CoUninitialize()
+        results["win32_com"] = "PASS"
+    except Exception:
+        results["win32_com"] = "FAIL"
+
+    # 8. Review-window toolkit; this also proves Tcl/Tk data is bundled.
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+        results["review_window_toolkit"] = "PASS"
+    except Exception:
+        results["review_window_toolkit"] = "FAIL"
 
     return results

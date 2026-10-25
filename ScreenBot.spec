@@ -11,11 +11,21 @@ a = Analysis(
         'tree_sitter_c_sharp',
         'tree_sitter_java',
         'tree_sitter_python',
+        'win32com',
+        'win32com.client',
+        'pythoncom',
+        'pywintypes',
+        'tkinter',
+        'tkinter.ttk',
+        'tkinter.messagebox',
+        'tkinter.font',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # win32ui/pythonwin need the MFC runtime, which this standalone Python does
+    # not ship. ScreenBot only uses win32com.client and pythoncom.
+    excludes=['win32ui', 'pythonwin'],
     noarchive=False,
     optimize=0,
 )

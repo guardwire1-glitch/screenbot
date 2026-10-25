@@ -115,7 +115,7 @@ The extension supplies the exact active buffer (including unsaved edits), dirty 
 
 If `pywin32` is installed in the Python environment, ScreenBot uses the Visual Studio DTE for the active buffer and Error List. Without `pywin32`, `Ctrl+Shift+F` cannot resolve the active path, so set `target_file_path` and Visual Studio is written through the disk adapter (saved files only).
 
-The DTE adapter initializes COM on each calling thread, keeps its connection state per thread, and retries a missing Visual Studio with a short exponential backoff (5 s up to 30 s). It therefore recovers when Visual Studio starts after ScreenBot or restarts. An apply is wrapped in a single DTE undo context, so one `Ctrl+Z` in Visual Studio removes the whole ScreenBot edit. Only the changed line range is replaced — the rest of the document, including breakpoints and bookmarks on untouched lines, is left alone. If another undo operation is already open, the change is held rather than joined to it. This path is covered by unit tests with a simulated DTE; a real Visual Studio session has not been automated yet, so verify one bind/apply/undo cycle on your machine before relying on it in class.
+The DTE adapter initializes COM on each calling thread, keeps its connection state per thread, and retries a missing Visual Studio with a short exponential backoff (5 s up to 30 s). It therefore recovers when Visual Studio starts after ScreenBot or restarts. An apply is wrapped in a single DTE undo context, so one `Ctrl+Z` in Visual Studio removes the whole ScreenBot edit. Only the changed line range is replaced — the rest of the document, including breakpoints and bookmarks on untouched lines, is left alone. If another undo operation is already open, the change is held rather than joined to it. Unit tests use a simulated DTE. A real Visual Studio 18 session was verified manually on 2026-10-25: bind, minimal apply, save, and one `Edit.Undo` that restored the original buffer and file. Breakpoints and bookmarks were not separately asserted; check them once on your machine before relying on them in class.
 
 ### JetBrains, Eclipse, NetBeans, SSMS, and other editors
 
@@ -123,7 +123,7 @@ These use the universal disk adapter: set `target_file_path` to the exact saved 
 
 The adapter writes automatically only when it can **prove** the editor buffer is saved. It inspects every visible editor window, not just the foreground one, because the lecture video normally has focus. A dirty marker in a matching window always holds the change. VS Code and Antigravity titles are trusted to show a clean buffer as well. JetBrains, Eclipse, NetBeans, SSMS, and Notepad++ do not report saved state reliably in their window titles, so a change for an open file in one of those editors is **queued for review instead of written automatically**. The same applies when the file is not visible in any editor window while an editor is running, since it may be a background tab with unsaved edits. If no editor is running at all, the file cannot have an unsaved buffer and a normal atomic write is allowed.
 
-There is no native plugin for these IDEs yet; they use the same bridge protocol, so a plugin can add the exact-buffer path later. The review UI lives in the VS Code-family extension and can resolve any pending item by path; after accepting a change for a disk-based editor, save/reload the file in that editor if it does not reload automatically.
+There is no native plugin for these IDEs yet; they use the same bridge protocol, so a plugin can add the exact-buffer path later. Queued changes can be reviewed without a VS Code-family editor: right-click the tray icon and choose **Review Pending Changes...**. That window lists every queued item and can accept or dismiss it by path; the VS Code command opens the same queue. After accepting a change for a disk-based editor, save/reload the file in that editor if it does not reload automatically.
 
 ### What is applied automatically
 
@@ -204,7 +204,14 @@ The `config.json` next to `ScreenBot.exe` holds the **shared defaults**. For you
 - VS Code extension: run `npm test` inside `ide_extension/vscode` (Node 20+; no editor required). It exercises the real HTTP bridge against a mocked `vscode` API.
 - CI: `.github/workflows/screenbot-tests.yml` runs both jobs for changes under `screen_bot/`, `tests/`, `ide_extension/`, and the workflow itself.
 
-These are contract and unit tests. They do not replace a recorded-lecture run or a real Visual Studio session; see `RISKS.md` for the remaining unautomated paths.
+These are contract and unit tests. CI still does not drive a real editor or call Gemini; see the manual release checks below and `RISKS.md` for the remaining unautomated paths.
+
+**Manual release checks (2026-10-25).** These were run on this machine, not in CI:
+
+- **Recorded lecture:** a 664 s Eclipse/Java recording (1920×1080) went through the real pipeline with live Gemini. Two-frame consensus held the first capture; the next applied one block through the installed VS Code extension. A lecturer edit produced zero disk writes across three scans, then exactly one pending review item. Accepting it through the bridge produced a 275-character file with zero tree-sitter errors and `javac` exit code 0. The lecturer-added lines kept four-space indentation inside a tab-indented file, so the result compiles but is not uniformly formatted; ScreenBot does not reformat by default.
+- **Visual Studio 18:** a private throwaway solution was bound through DTE, one minimal edit was applied and saved, and a single `Edit.Undo` restored the original buffer; after saving, the file on disk matched the original. Breakpoints and bookmarks were not separately asserted.
+- **Frozen executable:** rebuilt with PyInstaller 6.22.3 on Python 3.14.7. `ScreenBot.exe --selftest` passed all three tree-sitter parsers, pywin32 COM initialization, and a real Tk root; the API check is `SKIPPED` when no key is configured, and only `FAIL` makes the selftest exit non-zero. Archive inspection confirms `pythoncom314.dll`, `pywintypes314.dll`, `_tkinter.pyd`, Tcl/Tk DLLs, and the C#, Java, and Python grammar binaries are embedded.
+- **How to repeat:** `.venv\Scripts\python.exe -m PyInstaller ScreenBot.spec --noconfirm`, then run `dist\ScreenBot.exe --selftest` from a shell and confirm no `FAIL` line.
 
 ---
 
@@ -232,7 +239,7 @@ Check `direct_file_sync` in `config.json`. When it is `true`, a file must be bou
 Start ScreenBot first. The extension reads `%APPDATA%\ScreenBot\bridge.json`, which exists only while ScreenBot runs. For VS Code-family editors, confirm the extension folder is installed under that editor's extensions directory and fully restart the editor. `ScreenBot: Show Bridge Status` lists connected editor hosts. If the bridge port could not be bound, check `screen_bot.log`.
 
 **A change was held for review.**
-In the VS Code family, run `ScreenBot: Review Pending Code Changes` from the command palette. The same review UI can resolve an item for a file from another editor by path. The hold reason is written to the log and shown in the item: unsaved buffer, saved state that could not be verified (JetBrains/Eclipse and similar), hash conflict, a line you deliberately removed, the syntax gate, or worsening diagnostics. An identical change is queued once, not on every scan, and a dismissed change is not queued again. For a disk-based editor, save/reload the file after accepting so its buffer matches the new disk content.
+In the VS Code family, run `ScreenBot: Review Pending Code Changes` from the command palette, or right-click the tray icon and choose **Review Pending Changes...**; the tray window works for every IDE and resolves an item by path. The hold reason is written to the log and shown in the item: unsaved buffer, saved state that could not be verified (JetBrains/Eclipse and similar), hash conflict, a line you deliberately removed, the syntax gate, or worsening diagnostics. An identical change is queued once, not on every scan, and a dismissed change is not queued again. For a disk-based editor, save/reload the file after accepting so its buffer matches the new disk content.
 
 **Code appears twice, or lands in the Teams/YouTube chat.**
 This was the old behaviour when Direct File Sync wrote the file *and* pasted at the same time. Both are now mutually exclusive: a successful file write always skips caret injection, and the paste path aborts unless the exact editor window captured at snapshot time is still focused and is not a browser/meeting window.

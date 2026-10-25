@@ -110,6 +110,7 @@ _TITLE_IDES = (
 _TITLE_CLEAN_TRUSTED = frozenset({"vscode", "antigravity"})
 
 _DTE_PROGIDS = (
+    "VisualStudio.DTE.18.0",
     "VisualStudio.DTE.17.0",
     "VisualStudio.DTE.16.0",
     "VisualStudio.DTE",
@@ -451,6 +452,26 @@ def _initialize_com() -> bool:
     return True
 
 
+def _dte_line_column(text: str, index: int) -> Tuple[int, int]:
+    """Map a 0-based text index to a DTE 1-based line and column.
+
+    DTE absolute offsets count line breaks differently from Python and reject
+    the position one past a final newline, so positions are expressed as
+    line/column instead.
+    """
+    index = max(0, min(index, len(text)))
+    line = text.count("\n", 0, index) + 1
+    line_start = text.rfind("\n", 0, index) + 1
+    return line, index - line_start + 1
+
+
+def _dte_edit_point(text_doc, text: str, index: int):
+    line, column = _dte_line_column(text, index)
+    point = text_doc.StartPoint.CreateEditPoint()
+    point.MoveToLineAndOffset(line, column)
+    return point
+
+
 def _minimal_line_edit(
     current: str, proposed: str
 ) -> Optional[Tuple[int, int, str]]:
@@ -678,12 +699,9 @@ class VisualStudioAdapter:
             undo_opened = True
 
             start_offset, end_offset, replacement = edit_range
-            edit_point = text_doc.StartPoint.CreateEditPoint()
-            # DTE absolute offsets are 1-based.
-            edit_point.MoveToAbsoluteOffset(start_offset + 1)
+            edit_point = _dte_edit_point(text_doc, current, start_offset)
             if end_offset > start_offset:
-                end_point = text_doc.StartPoint.CreateEditPoint()
-                end_point.MoveToAbsoluteOffset(end_offset + 1)
+                end_point = _dte_edit_point(text_doc, current, end_offset)
                 edit_point.Delete(end_point)
             if replacement:
                 edit_point.Insert(replacement)

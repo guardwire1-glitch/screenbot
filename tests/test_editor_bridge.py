@@ -193,6 +193,74 @@ def test_pending_changes_resolve_through_the_registered_resolver(bridge):
     assert seen == [("pc_1", True)]
 
 
+def test_handler_send_survives_an_editor_that_closed_its_socket(bridge):
+    """A long-polling extension drops its socket when the editor exits.
+
+    The response has nowhere to go; the handler must swallow the disconnect
+    instead of letting socketserver print a traceback for every editor close.
+    """
+    handler_cls = bridge._handler_factory()
+
+    class ClosedSocket:
+        def __init__(self, error):
+            self.error = error
+
+        def write(self, data):
+            raise self.error
+
+    class FakeHandler:
+        def __init__(self, write_error):
+            self.wfile = ClosedSocket(write_error)
+            self.close_connection = False
+            self.sent = None
+
+        def send_response(self, status):
+            self.sent = status
+
+        def send_header(self, *args):
+            pass
+
+        def end_headers(self):
+            pass
+
+    for error in (ConnectionResetError(10054, "reset"), BrokenPipeError(32, "pipe")):
+        fake = FakeHandler(error)
+        handler_cls._send(fake, 200, {"ok": True, "text": "buffer"})
+        assert fake.sent == 200
+        assert fake.close_connection is True
+
+    fake = FakeHandler(ConnectionResetError(10054, "reset"))
+    handler_cls._send(fake, 204)
+    assert fake.sent == 204
+
+
+def test_handler_send_reports_missing_headers_as_a_disconnect(bridge):
+    handler_cls = bridge._handler_factory()
+
+    class FakeHandler:
+        close_connection = False
+        sent = None
+
+        class wfile:
+            @staticmethod
+            def write(data):
+                raise AssertionError("nothing should be written after end_headers fails")
+
+        def send_response(self, status):
+            self.sent = status
+
+        def send_header(self, *args):
+            pass
+
+        def end_headers(self):
+            raise ConnectionResetError(10054, "reset")
+
+    fake = FakeHandler()
+    handler_cls._send(fake, 200, {"ok": True})
+    assert fake.sent == 200
+    assert fake.close_connection is True
+
+
 def test_stop_releases_waiting_jobs_and_removes_discovery(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     srv = BridgeServer(pending_path=tmp_path / "pending.json", token="t", port=0)

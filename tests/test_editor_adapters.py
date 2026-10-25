@@ -268,6 +268,25 @@ class _FakeEditPoint:
             raise ValueError(f"offset out of range: {offset}")
         self.offset = offset
 
+    def MoveToLineAndOffset(self, line, column):
+        text = self.text_document.text
+        line_starts = [0]
+        for index, character in enumerate(text):
+            if character == "\n":
+                line_starts.append(index + 1)
+        if not 1 <= line <= len(line_starts):
+            raise ValueError(f"line out of range: {line}")
+        start = line_starts[line - 1]
+        if line < len(line_starts):
+            end = line_starts[line] - 1
+            if end > start and text[end - 1] == "\r":
+                end -= 1
+        else:
+            end = len(text)
+        if not 1 <= column <= end - start + 1:
+            raise ValueError(f"column out of range: {column}")
+        self.offset = start + column - 1
+
     def Delete(self, end):
         self.text_document.deleted.append(self.text_document.text[self.offset:end.offset])
         self.text_document.text = (
@@ -355,6 +374,55 @@ class _FakeDte:
     @property
     def ToolWindows(self):
         raise RuntimeError("no error list in tests")
+
+
+def test_dte_line_column_maps_crlf_boundaries():
+    text = "alpha\r\nbeta\r\ngamma\r\n"
+    assert editor_adapters._dte_line_column(text, 0) == (1, 1)
+    assert editor_adapters._dte_line_column(text, 2) == (1, 3)
+    assert editor_adapters._dte_line_column(text, 5) == (1, 6)
+    assert editor_adapters._dte_line_column(text, 7) == (2, 1)
+    assert editor_adapters._dte_line_column(text, len(text)) == (4, 1)
+
+    no_trailing = text.rstrip("\r\n")
+    assert editor_adapters._dte_line_column(
+        no_trailing, len(no_trailing)
+    ) == (3, 6)
+
+
+def test_visual_studio_apply_appends_at_the_end_of_a_newline_terminated_file(tmp_path):
+    path = tmp_path / "Demo.cs"
+    original = "class Demo\r\n{\r\n}\r\n"
+    path.write_text(original, encoding="utf-8", newline="")
+    document = _FakeDocument(path, original)
+    dte = _FakeDte(document)
+    adapter = _visual_studio(dte)
+    ctx = adapter.get_context(file_path=str(path))
+
+    proposed = original + "// ScreenBot\r\n"
+    result = adapter.apply(ctx, proposed)
+
+    assert result.ok and result.applied
+    assert document.text_document.text == proposed
+    assert document.text_document.inserted == ["// ScreenBot\r\n"]
+    assert document.text_document.deleted == []
+
+
+def test_visual_studio_apply_appends_without_a_trailing_newline(tmp_path):
+    path = tmp_path / "Demo.cs"
+    original = "class Demo\r\n{\r\n}"
+    path.write_text(original, encoding="utf-8", newline="")
+    document = _FakeDocument(path, original)
+    dte = _FakeDte(document)
+    adapter = _visual_studio(dte)
+    ctx = adapter.get_context(file_path=str(path))
+
+    proposed = original + "\r\n// ScreenBot\r\n"
+    result = adapter.apply(ctx, proposed)
+
+    assert result.ok and result.applied
+    assert document.text_document.text == proposed
+    assert document.text_document.inserted == ["}\r\n// ScreenBot\r\n"]
 
 
 def test_visual_studio_apply_is_minimal_and_undoable_as_one_action(tmp_path):
@@ -530,3 +598,21 @@ def test_visual_studio_com_and_connection_are_per_thread():
     assert len(initialized) == 2
     assert len(connected) == 2
     assert initialized[1] == connected[1] != main_thread
+
+
+def test_visual_studio_18_progid_is_tried_before_older_versions(monkeypatch):
+    import win32com.client
+
+    attempted = []
+    sentinel = object()
+
+    def fake_get_active(progid):
+        attempted.append(progid)
+        if progid == "VisualStudio.DTE.17.0":
+            return sentinel
+        raise RuntimeError("not running")
+
+    monkeypatch.setattr(win32com.client, "GetActiveObject", fake_get_active)
+
+    assert editor_adapters._connect_active_dte() is sentinel
+    assert attempted == ["VisualStudio.DTE.18.0", "VisualStudio.DTE.17.0"]

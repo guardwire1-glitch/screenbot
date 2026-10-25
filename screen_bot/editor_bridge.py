@@ -331,14 +331,20 @@ class BridgeServer:
 
             def _send(self, status: int, data: Optional[dict] = None) -> None:
                 body = b"" if data is None else json.dumps(data, ensure_ascii=False).encode("utf-8")
-                self.send_response(status)
-                if data is not None:
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                if body:
-                    self.wfile.write(body)
+                try:
+                    self.send_response(status)
+                    if data is not None:
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if body:
+                        self.wfile.write(body)
+                except (ConnectionError, OSError):
+                    # A long-polling extension closes its socket when the
+                    # editor exits. There is nobody left to receive the
+                    # response, so dropping it is the only correct action.
+                    self.close_connection = True
 
             def _body(self) -> dict:
                 try:

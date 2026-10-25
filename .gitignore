@@ -10,6 +10,7 @@ __pycache__/
 build/
 dist/
 *.spec.bak
+*.vsix
 
 # Logs and runtime sessions
 *.log
@@ -53,6 +54,7 @@ screen_bot/*.log
 screen_bot/*.mp4
 screen_bot/*.exe
 screen_bot/*.zip
+screen_bot/session_reconcile_report.md
 
 # Ignore legacy root smartwatch scripts
 ble_discover.py
