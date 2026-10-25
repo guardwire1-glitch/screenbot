@@ -17,9 +17,17 @@ def test_bot_initializes_core_architecture():
     assert hasattr(bot, "circuit_breaker")
     assert hasattr(bot, "consensus_tracker")
     assert hasattr(bot, "merge_engine")
-    assert hasattr(bot, "safe_injector")
+    assert hasattr(bot, "editor_router")
     assert hasattr(bot, "session_reconciler")
     assert hasattr(bot, "build_hash")
+
+
+def test_live_bot_has_no_legacy_clipboard_paths():
+    """The production bot must not hold the select-all clipboard injectors."""
+    bot = ScreenBot()
+    assert not hasattr(bot, "safe_injector")
+    assert not hasattr(bot, "smart_sync_controller")
+    assert not hasattr(bot, "select_all_and_paste")
 
 
 def test_bot_undo_rolls_back_master(tmp_path):

@@ -109,6 +109,180 @@ def test_process_code_shadow_defers_unstable_frame(screen_bot, monkeypatch):
     assert calls == []
 
 
+def test_active_line_hold_is_opt_in_for_auto_scans_only(screen_bot, monkeypatch):
+    """Auto scans hold a half-typed caret line; manual and force syncs do not."""
+    img = _patterned_frame()
+    monkeypatch.setattr(bot, "capture_stable_frame", lambda **kwargs: (img, True))
+    monkeypatch.setattr(bot, "encode_image_to_bytes", lambda *a, **k: b"png-bytes")
+    monkeypatch.setattr(bot, "user32", _FakeUser32(777))
+    monkeypatch.setattr(screen_bot.frame_archiver, "archive_frame", lambda *a, **k: None)
+    monkeypatch.setattr(screen_bot.occlusion_detector, "detect_occlusions", lambda *a, **k: [])
+    monkeypatch.setattr(
+        screen_bot.solver, "extract_lecture_code_structured",
+        lambda *a, **k: _single_frame_envelope("int x = 1;"),
+    )
+
+    seen = []
+
+    def spy(_lines, hold_active_line=False):
+        seen.append(hold_active_line)
+        return [], []
+
+    monkeypatch.setattr(screen_bot.consensus_tracker, "feed_frame_lines", spy)
+    screen_bot.last_lecture_frame = None
+
+    screen_bot.process_code_shadow(is_auto=True)                   # interval auto-scan
+    screen_bot.process_code_shadow(is_auto=False)                  # manual hotkey
+    screen_bot.process_code_shadow(is_auto=True, force_full=True)  # force full sync
+
+    assert seen == [True, False, False]
+
+
+# ---------------------------------------------------------------------------
+# Lecturer edits are review items, never silent skips or automatic writes
+# ---------------------------------------------------------------------------
+
+def _single_frame_envelope(code: str) -> str:
+    return json.dumps({
+        "tab": "Demo.cs",
+        "language": "csharp",
+        "overlay": False,
+        "eof_visible": True,
+        "code": code.strip("\n"),
+    })
+
+
+def test_process_code_shadow_queues_lecturer_edit(screen_bot, monkeypatch, tmp_path):
+    """An in-place lecturer edit must become a review item; nothing is written
+    and no caret/clipboard delivery happens."""
+    from editor_adapters import EditorContext, sha256_text
+
+    base = "class Demo\n{\n    int x = 1;\n}\n"
+    edited = base.replace("int x = 1;", "int x = 2;")
+    target = tmp_path / "Demo.cs"
+    target.write_text(base, encoding="utf-8")
+    ctx = EditorContext(
+        file_path=str(target),
+        text=base,
+        language="csharp",
+        dirty=False,
+        source="disk",
+        hash=sha256_text(base),
+        can_apply=True,
+    )
+
+    img = _patterned_frame()
+    monkeypatch.setattr(bot, "capture_stable_frame", lambda **kwargs: (img, True))
+    monkeypatch.setattr(bot, "encode_image_to_bytes", lambda *a, **k: b"png-bytes")
+    monkeypatch.setattr(bot, "user32", _FakeUser32(777))
+    monkeypatch.setattr(screen_bot, "_editor_context_for", lambda _target: ctx)
+    monkeypatch.setattr(screen_bot.frame_archiver, "archive_frame", lambda *a, **k: None)
+    monkeypatch.setattr(screen_bot.occlusion_detector, "detect_occlusions", lambda *a, **k: [])
+    monkeypatch.setattr(
+        screen_bot.solver, "extract_lecture_code_structured",
+        lambda *a, **k: _single_frame_envelope(edited),
+    )
+    monkeypatch.setattr(screen_bot.bridge.pending, "list", lambda: [])
+
+    screen_bot.direct_file_sync = False
+    screen_bot.target_file_path = str(target)
+    screen_bot.last_lecture_frame = None
+    screen_bot.consensus_tracker.reset()
+    screen_bot.consensus_tracker.required_observations = 1
+    doc = screen_bot.doc_registry.get("Demo.cs")
+    doc.seed_baseline(base)
+    screen_bot.master_tracker.master_code = base
+    screen_bot.last_code_shadow = base
+
+    delivered, queued = [], []
+    monkeypatch.setattr(
+        screen_bot, "inject_lecture_code", lambda *a, **k: delivered.append(1) or True
+    )
+    monkeypatch.setattr(
+        screen_bot, "_queue_pending",
+        lambda context, proposed, reason, diagnostics=None:
+            queued.append((proposed, reason)) or object(),
+    )
+
+    screen_bot.process_code_shadow(is_auto=False)   # persistence gate: 1/2
+    screen_bot.process_code_shadow(is_auto=False)   # confirmed -> review
+
+    assert delivered == []
+    assert target.read_text(encoding="utf-8") == base
+    assert len(queued) == 1
+    proposed, reason = queued[0]
+    assert "lecturer" in reason
+    assert "int x = 2;" in proposed
+    assert "int x = 1;" not in proposed
+    assert screen_bot.master_tracker.master_code == base
+
+
+def test_accepted_review_resyncs_and_drops_unsafe_old_undo_lineage(
+    screen_bot, monkeypatch, tmp_path
+):
+    from editor_adapters import sha256_text
+    from editor_bridge import PendingChange
+
+    base = "class Demo\n{\n    int x = 1;\n}\n"
+    edited = base.replace("int x = 1;", "int x = 2;")
+    target = tmp_path / "Demo.cs"
+    target.write_text(base, encoding="utf-8")
+    item = PendingChange(
+        id="pc_review", created_at=time.time(), file_path=str(target),
+        base_hash=sha256_text(base), proposed_text=edited,
+        reason="lecturer 1 edited block(s)", source="disk",
+    )
+    monkeypatch.setattr(screen_bot.bridge.pending, "get", lambda _item_id: item)
+    monkeypatch.setattr(
+        screen_bot.editor_router, "resolve_pending",
+        lambda _item_id, _accept: {
+            "ok": True, "applied": True, "text": edited, "hash": sha256_text(edited)
+        },
+    )
+
+    doc = screen_bot.doc_registry.get("Demo.cs")
+    doc.seed_baseline(base)
+    screen_bot.master_tracker.master_code = base
+    screen_bot.last_code_shadow = base
+    screen_bot.master_tracker.snapshots.append(base)
+
+    outcome = screen_bot._resolve_pending_change("pc_review", True)
+
+    assert outcome["ok"] is True
+    assert doc.text == edited
+    assert screen_bot.master_tracker.master_code == edited
+    assert screen_bot.last_code_shadow == edited
+    assert screen_bot.master_tracker.snapshots == []   # new lineage starts at the file
+    assert screen_bot._pending_review_exists(str(target), edited) is False
+
+
+def test_dismissed_review_is_not_requeued_every_frame(
+    screen_bot, monkeypatch, tmp_path
+):
+    from editor_adapters import sha256_text
+    from editor_bridge import PendingChange
+
+    base = "class Demo\n{\n    int x = 1;\n}\n"
+    edited = base.replace("int x = 1;", "int x = 2;")
+    target = tmp_path / "Demo.cs"
+    target.write_text(base, encoding="utf-8")
+    item = PendingChange(
+        id="pc_review", created_at=time.time(), file_path=str(target),
+        base_hash=sha256_text(base), proposed_text=edited,
+        reason="lecturer 1 edited block(s)", source="disk",
+    )
+    monkeypatch.setattr(screen_bot.bridge.pending, "get", lambda _item_id: item)
+    monkeypatch.setattr(
+        screen_bot.editor_router, "resolve_pending",
+        lambda _item_id, _accept: {"ok": True, "applied": False},
+    )
+
+    screen_bot._resolve_pending_change("pc_review", False)
+
+    assert target.read_text(encoding="utf-8") == base
+    assert screen_bot._pending_review_exists(str(target), edited) is True
+
+
 # ---------------------------------------------------------------------------
 # Snapshot-time HWND binding (ISSUE #06/#07)
 # ---------------------------------------------------------------------------
@@ -335,6 +509,37 @@ def test_direct_sync_queues_instead_of_writing_a_dirty_disk_buffer(
     assert applied is False
     assert reasons and "unsaved" in reasons[0]
     assert target.read_text(encoding="utf-8") == "class Demo\n{\n}\n"
+
+
+def test_direct_sync_queues_an_identical_held_change_only_once(
+    screen_bot, monkeypatch, tmp_path
+):
+    from editor_adapters import EditorContext
+    from editor_bridge import PendingStore
+
+    target = tmp_path / "Demo.cs"
+    target.write_text("class Demo\n{\n}\n", encoding="utf-8")
+    screen_bot.bridge.pending = PendingStore(tmp_path / "pending.json")
+    ctx = EditorContext(
+        file_path=str(target),
+        text=target.read_text(encoding="utf-8"),
+        language="csharp",
+        dirty=None,
+        source="disk",
+        hash="irrelevant",
+        can_apply=False,
+        hold_reason="saved state unknown",
+    )
+    monkeypatch.setattr(screen_bot, "_editor_context_for", lambda _t: ctx)
+    monkeypatch.setattr(screen_bot, "_notify_guard", lambda _msg: None)
+
+    proposal = "class Demo\n{\n    int x = 1;\n}\n"
+    assert screen_bot._apply_master_direct(target, proposal) is False
+    assert screen_bot._apply_master_direct(target, proposal) is False
+
+    items = screen_bot.bridge.pending.list()
+    assert len(items) == 1
+    assert "saved state unknown" in items[0].reason
 
 
 def test_direct_sync_holds_a_syntax_regression(screen_bot, monkeypatch, tmp_path):

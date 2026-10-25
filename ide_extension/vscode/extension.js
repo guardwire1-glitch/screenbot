@@ -218,18 +218,23 @@ async function handleApply(payload) {
     return { ok: false, conflict: true, error: "buffer changed since ScreenBot read it" };
   }
 
-  undoSnapshots.set(doc.uri.fsPath, { text: before, at: Date.now() });
-  if (undoSnapshots.size > 20) {
-    const oldest = [...undoSnapshots.entries()].sort((a, b) => a[1].at - b[1].at)[0];
-    if (oldest) {
-      undoSnapshots.delete(oldest[0]);
-    }
-  }
-
   try {
     const success = await replaceWholeBuffer(doc, normalizeNewlines(doc, newText));
     if (!success) {
       return { ok: false, error: "workspace.applyEdit was rejected" };
+    }
+    // The snapshot records both the previous buffer and the buffer this apply
+    // produced. Undo may only restore when the file still equals appliedHash.
+    undoSnapshots.set(doc.uri.fsPath, {
+      text: before,
+      appliedHash: sha256(doc.getText()),
+      at: Date.now(),
+    });
+    if (undoSnapshots.size > 20) {
+      const oldest = [...undoSnapshots.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (oldest) {
+        undoSnapshots.delete(oldest[0]);
+      }
     }
     if (payload.save !== false) {
       await doc.save();
@@ -268,7 +273,7 @@ async function handleUndo(payload) {
     return { ok: false, error: "no snapshot for this file" };
   }
   const doc = await documentForApply(filePath);
-  if (sha256(doc.getText()) !== sha256(snapshot.text)) {
+  if (!snapshot.appliedHash || sha256(doc.getText()) !== snapshot.appliedHash) {
     return { ok: false, conflict: true, error: "buffer changed; refusing to overwrite undo snapshot" };
   }
   const success = await replaceWholeBuffer(doc, normalizeNewlines(doc, snapshot.text));
@@ -362,6 +367,12 @@ async function pollLoop() {
 
 async function reviewPending() {
   const res = await request("GET", "/v1/pending", null, 4000);
+  if (res.status === 0) {
+    vscode.window.showWarningMessage(
+      "ScreenBot bridge is not reachable. Start ScreenBot first."
+    );
+    return;
+  }
   if (res.status !== 200 || !res.data || !res.data.items || !res.data.items.length) {
     vscode.window.showInformationMessage("ScreenBot has no pending changes.");
     return;
@@ -378,10 +389,27 @@ async function reviewPending() {
     return;
   }
   const pending = picked.item;
+
+  // The list is a summary on purpose; the proposed buffer is only sent when
+  // the user opens a specific change.
+  const detail = await request(
+    "GET",
+    `/v1/pending/${encodeURIComponent(pending.id)}`,
+    null,
+    4000
+  );
+  const proposal = detail.status === 200 && detail.data && detail.data.item;
+  if (!proposal || typeof proposal.proposed_text !== "string") {
+    vscode.window.showErrorMessage(
+      "ScreenBot could not load the proposed change. It may already have been applied or dismissed."
+    );
+    return;
+  }
+
   try {
     const current = await vscode.workspace.openTextDocument(vscode.Uri.file(pending.file_path));
     const proposed = await vscode.workspace.openTextDocument({
-      content: pending.proposed_text,
+      content: proposal.proposed_text,
       language: current.languageId,
     });
     await vscode.commands.executeCommand(
@@ -457,4 +485,10 @@ function deactivate() {
   }
 }
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  handleJob,
+  reviewPending,
+  request,
+};

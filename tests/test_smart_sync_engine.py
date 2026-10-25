@@ -4,7 +4,7 @@ Run with: uv run pytest -v tests/test_smart_sync_engine.py
 """
 
 from pathlib import Path
-from screen_bot.smart_sync_engine import (
+from screen_bot.legacy.smart_sync_engine import (
     ASTHealer,
     ScreenBotSmartController,
     norm,

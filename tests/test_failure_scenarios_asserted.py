@@ -13,7 +13,7 @@ from screen_bot.frame_pipeline import OcclusionDetector
 from screen_bot.code_validator import LineConsensusTracker, is_valid_code_line, normalize_for_diff
 from screen_bot.merge_engine import MergeEngine
 from screen_bot.ai_vision_extractor import ExtractedLine, UNREADABLE_TOKEN, ExtractionResult
-from screen_bot.injector import SafeInjector, WindowFocusContext
+from screen_bot.legacy.injector import SafeInjector, WindowFocusContext
 from screen_bot.failsafes import CircuitBreaker
 from screen_bot.shadow_master import ShadowMaster, MasterChangeEvent
 from screen_bot.ai_solver import ScreenSolver

@@ -68,11 +68,10 @@ from merge_engine import MergeEngine, MergeDecision
 from doc_merge import (
     DocMerger, Registry as DocRegistry, FrameLine as DocFrameLine,
     Meta as DocMeta, Cfg as DocCfg, plan_injection, apply_plan,
+    plan_review_changes, review_state_present,
 )
 from ast_healer import HyperAwareCodeEngine
 from smart_context_engine import SmartCodeSynchronizer, heal_and_format
-from smart_sync_engine import ScreenBotSmartController, SyncResult, wait_for_physical_keys_released
-from injector import SafeInjector, WindowFocusContext
 from failsafes import CircuitBreaker, ScanWatchdog, compute_build_hash
 from session_reconciler import SessionReconciler, FlaggedItem
 from harness import run_selftest
@@ -131,6 +130,7 @@ def load_config() -> Dict[str, Any]:
         "stability_threshold": 2.0,
         "lecture_pixel_diff_threshold": 2.0,
         "max_frame_age_seconds": 12,
+        "active_line_hold_frames": 2,
         "quota_cooldown_seconds": 90,
         "format_on_apply": False,
         "auto_type_on_solve": False,
@@ -531,7 +531,11 @@ class ScreenBot:
         self.frame_archiver = FrameArchiver(session_dir=SCRIPT_DIR / "session_frames")
         self.stability_checker = FrameStabilityChecker(stability_threshold=0.02)
         self.occlusion_detector = OcclusionDetector()
-        self.consensus_tracker = LineConsensusTracker(required_observations=2, min_confidence=0.85)
+        self.consensus_tracker = LineConsensusTracker(
+            required_observations=2,
+            min_confidence=0.85,
+            active_line_hold_frames=int(self.config.get("active_line_hold_frames", 2)),
+        )
         self.merge_engine = MergeEngine()
         # Consensus already requires two frames, so the document merger may apply
         # an insertion on its first accepted frame. Destructive edits stay gated.
@@ -540,12 +544,6 @@ class ScreenBot:
         ))
         self.ast_healer = HyperAwareCodeEngine(default_lang=self.current_subject)
         self.smart_synchronizer = SmartCodeSynchronizer(require_confirmations=2)
-        self.smart_sync_controller = ScreenBotSmartController(
-            workspace_roots=[Path.cwd(), SCRIPT_DIR, Path.home() / "Documents", Path.home() / "source"],
-            require_confirmations=2,
-            history_dir=SCRIPT_DIR / ".screenbot_history",
-        )
-        self.safe_injector = SafeInjector()
         self.circuit_breaker = CircuitBreaker(max_edits_per_minute=3)
         self.scan_watchdog = ScanWatchdog(timeout_seconds=30.0)
         self.session_reconciler = SessionReconciler(report_path=SCRIPT_DIR / "session_reconcile_report.md")
@@ -559,6 +557,9 @@ class ScreenBot:
         self._stopping = False
         self._consensus_file = ""
         self._last_pending_count = 0
+        self._review_lock = threading.RLock()
+        self._review_notices: Dict[str, str] = {}
+        self._dismissed_reviews: Dict[str, set] = {}
 
         # IDE-agnostic editor bridge. The socket is started by main(), not by
         # the constructor, so unit tests and one-off imports never bind a port.
@@ -572,7 +573,7 @@ class ScreenBot:
             logger=logger,
             format_on_apply=bool(self.config.get("format_on_apply", False)),
         )
-        self.bridge.pending_resolver = self.editor_router.resolve_pending
+        self.bridge.pending_resolver = self._resolve_pending_change
         self._bridge_started = False
 
     def check_and_set_busy(self, action_name: str) -> bool:
@@ -871,6 +872,11 @@ class ScreenBot:
 
     def _queue_pending(self, context: EditorContext, proposed: str, reason: str,
                        diagnostics=None) -> Optional[PendingChange]:
+        # A held change leaves the master unadvanced, so the same proposal is
+        # regenerated every scan. Queue it once, and respect a dismissal.
+        if self._pending_review_exists(context.file_path, proposed):
+            logger.info("Identical review item is already queued or was dismissed.")
+            return None
         try:
             change = self.editor_router.queue_pending(context, proposed, reason, diagnostics)
             logger.warning(f"Change held for review: {reason} ({context.file_path}).")
@@ -879,6 +885,154 @@ class ScreenBot:
         except Exception as e:
             logger.error(f"Could not queue pending change: {e}")
             return None
+
+    # ------------------------------------------------------------------
+    # Lecturer edits: detected by DocMerger, never auto-applied
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _review_file_key(context) -> str:
+        path = getattr(context, "file_path", "") or ""
+        try:
+            return str(Path(path)).lower()
+        except Exception:
+            return str(path).lower()
+
+    @staticmethod
+    def _review_summary(reviews) -> str:
+        edits = sum(1 for r in reviews if r.kind != "deletion")
+        deletes = sum(1 for r in reviews if r.kind == "deletion")
+        parts = []
+        if edits:
+            parts.append(f"{edits} edited block(s)")
+        if deletes:
+            parts.append(f"{deletes} deleted block(s)")
+        return " and ".join(parts) or "code edit"
+
+    def _notify_review_once(self, file_path: str, message: str) -> None:
+        key = str(file_path or "unbound").lower()
+        with self._review_lock:
+            if self._review_notices.get(key) == message:
+                return
+            self._review_notices[key] = message
+        self._notify_guard(message)
+
+    def _pending_review_exists(self, file_path: str, proposed: str) -> bool:
+        """A review item for this exact proposal is already waiting (or was
+        explicitly dismissed). Never re-queue the same edit every scan cycle."""
+        try:
+            key = str(Path(file_path)).lower()
+        except Exception:
+            key = str(file_path).lower()
+        fingerprint = sha256_text(proposed)
+        with self._review_lock:
+            if fingerprint in self._dismissed_reviews.get(key, set()):
+                return True
+        try:
+            for item in self.bridge.pending.list():
+                try:
+                    same_file = str(Path(item.file_path)).lower() == key
+                except Exception:
+                    same_file = str(item.file_path).lower() == key
+                if same_file and sha256_text(item.proposed_text) == fingerprint:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _resync_after_external_change(self, doc, lecture_text: str, file_text: str) -> None:
+        """Adopt a file changed outside ScreenBot (review accepted or manual typing).
+
+        Prior undo snapshots are dropped on purpose: restoring one would overwrite
+        a change ScreenBot never made. The new lineage starts at the file itself.
+        """
+        doc.seed_baseline(lecture_text)
+        self.master_tracker.snapshots.clear()
+        self.master_tracker.read_counts.clear()
+        self.master_tracker.master_code = file_text
+        self.last_code_shadow = file_text
+        self.last_injection_ended_with_newline = False
+
+    def _resolve_pending_change(self, item_id: str, accept: bool) -> Dict[str, Any]:
+        item = self.bridge.pending.get(item_id)
+        outcome = self.editor_router.resolve_pending(item_id, accept)
+        if not outcome.get("ok") or item is None:
+            return outcome
+        try:
+            key = str(Path(item.file_path)).lower()
+        except Exception:
+            key = str(item.file_path).lower()
+        if accept:
+            applied_text = str(outcome.get("text") or item.proposed_text)
+            with self._review_lock:
+                doc = self.doc_registry.get(Path(item.file_path).name)
+                self._resync_after_external_change(doc, applied_text, applied_text)
+                self._dismissed_reviews.pop(key, None)
+                self._review_notices.pop(key, None)
+            logger.info(f"Reviewed lecture edit accepted; master resynced for {item.file_path}.")
+        else:
+            with self._review_lock:
+                self._dismissed_reviews.setdefault(key, set()).add(sha256_text(item.proposed_text))
+                self._review_notices[key] = "edit dismissed"
+            logger.info(f"Reviewed lecture edit dismissed for {item.file_path}; sync stays paused.")
+        return outcome
+
+    def _handle_review_edits(self, frame_id: str, doc, merge_res, ctx,
+                             baseline: str) -> None:
+        """Turn a confirmed lecturer edit into a review item, never a write.
+
+        The master is not mutated by the edit; DocMerger re-reports it on every
+        frame until the file actually matches. Delivery of unrelated additions
+        is paused for this file while that review is outstanding so the old and
+        new versions of the edited block can never both be written.
+        """
+        key = self._review_file_key(ctx) if ctx is not None else "unbound"
+        base_master = merge_res.code
+        review_master = merge_res.review_code
+        proposed, problems = plan_review_changes(base_master, review_master, baseline)
+        if proposed is None:
+            if review_state_present(base_master, review_master, baseline):
+                with self._review_lock:
+                    self._resync_after_external_change(doc, review_master, baseline)
+                    self._review_notices.pop(key, None)
+                logger.info(
+                    f"[{frame_id}] Lecturer edit is already in the file; resynced without typing."
+                )
+                return
+            reason = problems[0] if problems else "the edited region could not be located"
+            self._notify_review_once(
+                key, f"Lecture edit held for manual merge: {reason}. Nothing was typed."
+            )
+            logger.warning(f"[{frame_id}] Lecture edit not queued: {reason}")
+            return
+
+        steps, conflicts = plan_injection(review_master, proposed)
+        if steps:
+            proposed = apply_plan(proposed, steps)
+        if proposed.replace("\r\n", "\n").strip() == baseline.replace("\r\n", "\n").strip():
+            with self._review_lock:
+                self._resync_after_external_change(doc, review_master, baseline)
+                self._review_notices.pop(key, None)
+            logger.info(f"[{frame_id}] File already contains the lecture edit; master synchronized.")
+            return
+
+        if ctx is None:
+            self._notify_review_once(
+                "unbound", "Lecture edit detected but no file is bound; nothing was typed."
+            )
+            logger.warning(f"[{frame_id}] Lecture edit needs review but there is no editor context.")
+            return
+
+        if self._pending_review_exists(ctx.file_path, proposed):
+            logger.info(f"[{frame_id}] Lecturer edit already queued; auto-delivery stays paused.")
+            return
+
+        summary = self._review_summary(merge_res.reviews)
+        if conflicts:
+            summary += f"; {len(conflicts)} local difference(s) preserved"
+        change = self._queue_pending(ctx, proposed, f"lecturer {summary}", ctx.diagnostics)
+        if change is not None:
+            with self._review_lock:
+                self._review_notices.pop(key, None)
 
     @staticmethod
     def _missing_delivered_lines(previous_master: str, current_text: str) -> List[str]:
@@ -906,10 +1060,11 @@ class ScreenBot:
             logger.error(f"Direct File Sync: cannot read editor/file context for {target}.")
             self._notify_guard("Direct sync: target file is not readable. Nothing was typed.")
             return False
-        if not ctx.can_apply or (ctx.dirty and ctx.source == "disk"):
+        if not ctx.can_apply:
             self._queue_pending(
                 ctx, apply_plan(ctx.text, plan_injection(master_text, ctx.text)[0]),
-                "editor buffer has unsaved changes", ctx.diagnostics,
+                ctx.hold_reason or "editor buffer has unsaved changes",
+                ctx.diagnostics,
             )
             return False
 
@@ -1137,63 +1292,6 @@ class ScreenBot:
             if pasted:
                 # Give the target a moment to consume the clipboard before the
                 # user's own clipboard contents are restored.
-                time.sleep(0.12)
-            if original_clip is not None:
-                try:
-                    pyperclip.copy(original_clip)
-                except Exception:
-                    pass
-
-    def select_all_and_paste(self, text: str, target_hwnd: Optional[int] = None) -> bool:
-        """Ctrl+A then Ctrl+V. Only used for an explicit full-buffer mirror.
-
-        A failed clipboard write aborts instead of falling back to typing:
-        typing at the caret after a failed select-all would append partial code
-        to the wrong place.
-        """
-        if not text:
-            return False
-        if not self._caret_target_safe(target_hwnd, "paste"):
-            return False
-
-        VK_CONTROL, VK_A, VK_V, KEYUP = 0x11, 0x41, 0x56, 0x0002
-        original_clip: Optional[str] = None
-        pasted = False
-        try:
-            self.wait_for_modifiers_release()
-            try:
-                original_clip = pyperclip.paste()
-            except Exception:
-                original_clip = None
-            pyperclip.copy(text)
-            time.sleep(0.04)
-            if not self._caret_target_safe(target_hwnd, "paste"):
-                return False
-
-            user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            time.sleep(0.02)
-            user32.keybd_event(VK_A, 0, 0, 0)
-            time.sleep(0.03)
-            user32.keybd_event(VK_A, 0, KEYUP, 0)
-            time.sleep(0.02)
-            user32.keybd_event(VK_V, 0, 0, 0)
-            time.sleep(0.03)
-            user32.keybd_event(VK_V, 0, KEYUP, 0)
-            user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
-            pasted = True
-            logger.info(f"Mirror paste replaced the editor buffer ({len(text)} chars).")
-            return True
-        except Exception as e:
-            logger.error(f"select_all_and_paste aborted without typing: {e}")
-            return False
-        finally:
-            try:
-                user32.keybd_event(VK_A, 0, KEYUP, 0)
-                user32.keybd_event(VK_V, 0, KEYUP, 0)
-                user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
-            except Exception:
-                pass
-            if pasted:
                 time.sleep(0.12)
             if original_clip is not None:
                 try:
@@ -1843,7 +1941,10 @@ class ScreenBot:
             if file_key:
                 self._consensus_file = file_key
 
-            accepted, pending = self.consensus_tracker.feed_frame_lines(parsed.lines)
+            accepted, pending = self.consensus_tracker.feed_frame_lines(
+                parsed.lines,
+                hold_active_line=is_auto and not force_full,
+            )
             self._decay_candidate_reads(parsed.lines)
             logger.info(
                 f"[{frame_id}] Consensus: {len(accepted)} accepted, "
@@ -1923,6 +2024,10 @@ class ScreenBot:
                 return
 
             delivery_baseline = ctx.text if ctx is not None else baseline
+            if merge_res.reviews:
+                self._handle_review_edits(frame_id, doc, merge_res, ctx, delivery_baseline)
+                return
+
             steps, conflicts = plan_injection(merged_code, delivery_baseline)
             delta_lines: list[str] = []
             for step in steps:

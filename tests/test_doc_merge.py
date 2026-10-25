@@ -1,6 +1,7 @@
 import random
 from screen_bot.doc_merge import (DocMerger, FrameLine, Meta, Cfg, plan_injection,
-                                  apply_plan, Registry, norm, entities, UNREADABLE)
+                                  apply_plan, Registry, norm, entities, UNREADABLE,
+                                  plan_review_changes, review_state_present)
 
 V1 = """public class Main {
 
@@ -203,6 +204,77 @@ def test_breaker_stops_flapping():
         notes += m.merge(fr(body), Meta(top=True, bottom=True)).notes
         m.merge(fr(base), Meta(top=True, bottom=True))
     assert "breaker_tripped" in notes
+
+
+def test_live_mode_reports_edit_as_review_without_touching_master():
+    base = "class A\n{\n    int x = 1;\n}"
+    edit = base.replace("int x = 1;", "int x = 2;")
+    m = DocMerger("A.cs", Cfg(req_rewrite=2))   # matches the live DocCfg
+    m.seed_baseline(base)
+
+    first = m.merge(fr(edit), Meta(allow_destructive=False))
+    assert first.reviews == [] and m.text == base
+
+    second = m.merge(fr(edit), Meta(allow_destructive=False))
+    assert second.event == "review"
+    assert second.review_code == edit
+    assert m.text == base                       # never auto-replaces
+    assert len(second.reviews) == 1
+    assert second.reviews[0].kind == "replacement"
+    assert any("int x = 1;" in line for line in second.reviews[0].old)
+    assert any("int x = 2;" in line for line in second.reviews[0].new)
+
+    # A confirmed review must stay visible on every following frame.
+    third = m.merge(fr(edit), Meta(allow_destructive=False))
+    assert third.event == "review" and third.review_code == edit
+
+
+def test_live_mode_reports_loose_line_edit_only_after_persistence():
+    base = "int a = 1;\nint b = 2;\nint c = 3;"
+    edit = "int a = 1;\nint b = 9;\nint c = 3;"
+    m = DocMerger()
+    m.seed_baseline(base)
+    meta = Meta(allow_destructive=False, top=True, bottom=True)
+
+    first = m.merge(fr(edit), meta)
+    assert first.reviews == []
+    second = m.merge(fr(edit), meta)
+    assert second.review_code == edit
+    assert m.text == base
+
+
+def test_live_mode_never_proposes_edits_from_unreliable_frames():
+    base = "class A\n{\n    int x = 1;\n}"
+    edit = base.replace("int x = 1;", "int x = 2;")
+    m = DocMerger("A.cs")
+    m.seed_baseline(base)
+    meta = Meta(allow_destructive=False, flags=("folded",))
+
+    result = None
+    for _ in range(4):
+        result = m.merge(fr(edit), meta)
+    assert result.reviews == [] and result.review_code == ""
+    assert "destructive_skipped" in result.notes
+    assert m.text == base
+
+
+def test_plan_review_changes_preserves_local_edits_and_refuses_conflicts():
+    base = "class A\n{\n    int x = 1;\n    int y = 2;\n}"
+    review = base.replace("int x = 1;", "int x = 9;")
+    target = base.replace("int y = 2;", "int y = 2;\n    // local note")
+
+    proposed, problems = plan_review_changes(base, review, target)
+    assert problems == []
+    assert "int x = 9;" in proposed and "// local note" in proposed
+
+    locally_changed, problems = plan_review_changes(
+        base, review, base.replace("int x = 1;", "int x = 5;")
+    )
+    assert locally_changed is None and problems
+
+    assert review_state_present(base, review, review + "\n// local note")
+    assert not review_state_present(base, review, base)
+    assert not review_state_present(base, review, review + "\nint x = 1;")
 
 
 def test_fuzz_small_docs_converge_no_duplicates():

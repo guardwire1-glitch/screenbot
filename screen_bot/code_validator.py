@@ -79,14 +79,126 @@ def is_weak_line(text: str) -> bool:
     return re.fullmatch(r"[{}()\[\];,\s]*", text or "") is not None
 
 
+_OPENERS = {"(": ")", "[": "]", "{": "}"}
+_CONTINUATION_TAIL = set("=+-*/%&|^!?:,.([{")
+_DANGLING_WORD = re.compile(
+    r"(?:^|\s)(?:if|for|while|else|switch|case|catch|return|throw|new|await|"
+    r"yield|import|from|using|do|try|finally)$",
+    re.IGNORECASE,
+)
+_CONTROL_HEADER = re.compile(
+    r"^(?:else\s+)?(?:if|for|foreach|while|switch|catch|using|lock|fixed|"
+    r"synchronized)\b",
+    re.IGNORECASE,
+)
+
+
+def _header_without_body(text: str) -> bool:
+    """True for a control header whose condition ends the line (`if (ready)`).
+
+    The line is already known to be balanced, so the first paren group must
+    start right after the keyword and close at the last non-space character;
+    anything after it is a body and the statement may be complete.
+    """
+    match = _CONTROL_HEADER.match(text)
+    if not match:
+        return False
+    rest = text[match.end():].lstrip()
+    if not rest.startswith("("):
+        return False
+
+    depth = 0
+    quote = ""
+    escaped = False
+    for pos, char in enumerate(rest):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in "\"'`":
+            quote = char
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return not rest[pos + 1:].strip()
+    return False
+
+
+def looks_incomplete(text: str) -> bool:
+    """A cheap, language-agnostic signal that a line is still being written.
+
+    Used only for the bottom-most line on screen. A multi-line call's first
+    line also looks locally incomplete, which is why the active-line hold is
+    released as soon as another line appears below it or the user forces a scan.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith(("//", "#", "--", "/*")):
+        return False
+
+    stack: List[str] = []
+    quote = ""
+    escaped = False
+    idx = 0
+    while idx < len(stripped):
+        char = stripped[idx]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            idx += 1
+            continue
+        if stripped.startswith("//", idx):
+            break
+        if char in "\"'`":
+            quote = char
+            idx += 1
+            continue
+        if char in _OPENERS:
+            stack.append(_OPENERS[char])
+        elif char in ")]}":
+            if stack and stack.pop() != char:
+                return True
+        idx += 1
+
+    if quote or stack:
+        return True
+    if stripped[-1] in _CONTINUATION_TAIL or stripped.endswith("\\"):
+        return True
+    if _header_without_body(stripped):
+        return True
+    return _DANGLING_WORD.search(stripped) is not None
+
+
 class LineConsensusTracker:
     """Tracks consecutive observations across frames. A line is admitted only
     after it has been seen in `required_observations` consecutive frames with
-    identical normalized text. A line seen twice inside one frame counts once."""
+    identical normalized text. A line seen twice inside one frame counts once.
 
-    def __init__(self, required_observations: int = 2, min_confidence: float = 0.85):
+    `hold_active_line` adds an explicit, opt-in hold for the bottom-most line:
+    that is where a lecturer's caret is in a live-coding session. A balanced
+    bottom line waits `active_line_hold_frames` extra clean frames; an
+    incomplete one is withheld until it stops being the bottom line or the user
+    forces a sync (`hold_active_line=False`). Closers/blank lines are exempt so
+    the end of a block is never withheld.
+    """
+
+    def __init__(self, required_observations: int = 2, min_confidence: float = 0.85,
+                 active_line_hold_frames: int = 2):
         self.required_observations = max(1, int(required_observations))
         self.min_confidence = min_confidence
+        self.active_line_hold_frames = max(0, int(active_line_hold_frames))
         self._history: Dict[Tuple[str, int], Dict] = {}
         self._frame_counter = 0
         self._last_pending_count = 0
@@ -99,14 +211,24 @@ class LineConsensusTracker:
         return self._last_pending_count > 0
 
     def feed_frame_lines(
-        self, lines: List[ExtractedLine]
+        self, lines: List[ExtractedLine], hold_active_line: bool = False
     ) -> Tuple[List[ExtractedLine], List[ExtractedLine]]:
         self._frame_counter += 1
         accepted: List[ExtractedLine] = []
         pending: List[ExtractedLine] = []
         frame_occ: Dict[str, int] = {}
 
-        for line in lines:
+        active_idx = None
+        if hold_active_line:
+            for idx, line in enumerate(lines):
+                if is_valid_code_line(line):
+                    active_idx = idx
+            if active_idx is not None:
+                active_text = getattr(lines[active_idx], "text", "") or ""
+                if not normalize_for_diff(active_text) or is_weak_line(active_text):
+                    active_idx = None
+
+        for idx, line in enumerate(lines):
             if not is_valid_code_line(line):
                 continue
 
@@ -142,12 +264,20 @@ class LineConsensusTracker:
                 }
                 self._history[key] = entry
 
-            needs = 1 if (entry["blank"] and not is_weak_line(norm)) else self.required_observations
             # Blank separator lines still need two sightings: a single blank row
             # may just be an OCR gap, not a real blank line in the file.
-            if entry["blank"]:
-                needs = self.required_observations
-            if entry["count"] >= needs:
+            needs = self.required_observations
+            hold_forever = False
+            if idx == active_idx:
+                text = getattr(line, "text", "") or ""
+                if looks_incomplete(text):
+                    # Never write a half-typed caret line automatically. It is
+                    # released when it stops being the bottom line (the next
+                    # line was typed) or when the user forces a sync.
+                    hold_forever = True
+                else:
+                    needs = max(needs, self.required_observations + self.active_line_hold_frames)
+            if not hold_forever and entry["count"] >= needs:
                 accepted.append(line)
             else:
                 pending.append(line)

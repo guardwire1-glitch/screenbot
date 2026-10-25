@@ -95,6 +95,8 @@ Double-click **`install_startup.bat`**.
 
 ScreenBot starts a localhost-only editor bridge with the app. It writes a token-protected discovery file to `%APPDATA%\ScreenBot\bridge.json` and removes it when ScreenBot exits. The bridge is how ScreenBot reads the real buffer/file and the editor's diagnostics before writing, and how it applies a hash-checked edit instead of blind keystrokes.
 
+Every request must carry the token in the `X-ScreenBot-Token` header. A token in the query string is rejected, because URLs leak through proxies, logs, and history. The only unauthenticated endpoint is `/v1/health`, which reports no file content.
+
 ### VS Code family (VS Code, Antigravity, Cursor, Windsurf)
 
 Install the bundled extension from `ide_extension/vscode`:
@@ -113,21 +115,29 @@ The extension supplies the exact active buffer (including unsaved edits), dirty 
 
 If `pywin32` is installed in the Python environment, ScreenBot uses the Visual Studio DTE for the active buffer and Error List. Without `pywin32`, `Ctrl+Shift+F` cannot resolve the active path, so set `target_file_path` and Visual Studio is written through the disk adapter (saved files only).
 
+The DTE adapter initializes COM on each calling thread, keeps its connection state per thread, and retries a missing Visual Studio with a short exponential backoff (5 s up to 30 s). It therefore recovers when Visual Studio starts after ScreenBot or restarts. An apply is wrapped in a single DTE undo context, so one `Ctrl+Z` in Visual Studio removes the whole ScreenBot edit. Only the changed line range is replaced — the rest of the document, including breakpoints and bookmarks on untouched lines, is left alone. If another undo operation is already open, the change is held rather than joined to it. This path is covered by unit tests with a simulated DTE; a real Visual Studio session has not been automated yet, so verify one bind/apply/undo cycle on your machine before relying on it in class.
+
 ### JetBrains, Eclipse, NetBeans, SSMS, and other editors
 
-These use the universal disk adapter: set `target_file_path` to the exact saved file (ScreenBot will not guess a path from a filename), and Direct File Sync reads and writes that file atomically, preserving its existing newline style. It refuses to write when the foreground editor's title marks the bound file as unsaved and queues the change instead. There is no native plugin for these IDEs yet; they use the same bridge protocol, so a plugin can add the exact-buffer path later. The review UI currently exists only in the VS Code-family extension.
+These use the universal disk adapter: set `target_file_path` to the exact saved file (ScreenBot will not guess a path from a filename), and Direct File Sync reads and writes that file atomically, preserving its existing newline style.
+
+The adapter writes automatically only when it can **prove** the editor buffer is saved. It inspects every visible editor window, not just the foreground one, because the lecture video normally has focus. A dirty marker in a matching window always holds the change. VS Code and Antigravity titles are trusted to show a clean buffer as well. JetBrains, Eclipse, NetBeans, SSMS, and Notepad++ do not report saved state reliably in their window titles, so a change for an open file in one of those editors is **queued for review instead of written automatically**. The same applies when the file is not visible in any editor window while an editor is running, since it may be a background tab with unsaved edits. If no editor is running at all, the file cannot have an unsaved buffer and a normal atomic write is allowed.
+
+There is no native plugin for these IDEs yet; they use the same bridge protocol, so a plugin can add the exact-buffer path later. The review UI lives in the VS Code-family extension and can resolve any pending item by path; after accepting a change for a disk-based editor, save/reload the file in that editor if it does not reload automatically.
 
 ### What is applied automatically
 
 A direct apply happens only when:
 
 - the target was explicitly bound (`Ctrl+Shift+F`, a valid `target_file_path`, or the tray menu);
+- for disk-based editors, the buffer's saved state is positively known (VS Code/Antigravity titles, or no editor running);
 - the file/buffer still matches the content ScreenBot read (hash check);
 - the merged document does not re-add lines the user deliberately deleted after a previous sync;
 - syntax validation of the **full proposed document** passes;
-- the editor's error count does not increase (VS Code family / Visual Studio; disk targets have no diagnostics).
+- the editor's error count does not increase (VS Code family / Visual Studio; disk targets have no diagnostics);
+- in Visual Studio, no other undo operation is open.
 
-Otherwise the change is queued for review or discarded, and ScreenBot does not advance its master. Compatible new lecture lines can still be applied when unrelated user code differs; the conflicting part is queued.
+Otherwise the change is queued for review or discarded, and ScreenBot does not advance its master. Compatible new lecture lines can still be applied when unrelated user code differs; the conflicting part is queued. An identical held change is queued only once, and an explicitly dismissed proposal is not queued again on the next scan.
 
 Indentation comes from the merged document, and ScreenBot preserves the file's existing CRLF/LF style. It does not silently reformat your file. To run the editor's formatter after an apply, set `format_on_apply` to `true` in ScreenBot's config, or enable the `screenbot.formatOnApply` setting in the VS Code-family extension. Formatting the whole file can move code you did not touch.
 
@@ -160,6 +170,7 @@ The `config.json` next to `ScreenBot.exe` holds the **shared defaults**. For you
   "lecture_pixel_diff_threshold": 2.0,
   "max_frame_age_seconds": 12,
   "quota_cooldown_seconds": 90,
+  "active_line_hold_frames": 2,
   "format_on_apply": false
 }
 ```
@@ -179,10 +190,19 @@ The `config.json` next to `ScreenBot.exe` holds the **shared defaults**. For you
 - `lecture_pixel_diff_threshold`: When auto-scanning, skip the AI call if the new frame differs from the last scanned frame by less than this amount (default `2.0`). Pending consensus lines force a scan.
 - `max_frame_age_seconds`: Discard an extraction if the frame is older than this when the AI answer arrives (default `12`). Set `0` to disable.
 - `quota_cooldown_seconds`: Pause after a Gemini 429/quota error (default `90`, minimum `15`). Auto-scan and manual code sync both respect the cooldown.
+- `active_line_hold_frames`: Extra clean scans the bottom-most (currently typed) line must survive before auto-delivery (default `2`). Incomplete lines such as `int total =` or `if (ready)` are held until they become complete or another line appears below them. Manual sync bypasses the hold. Set to `0` to disable the extra hold.
 - `format_on_apply`: Run the editor's formatter after a successful direct apply (default `false`). This can reformat the whole file.
 - `typing_wpm`: Typing speed for the highlight-and-solve typer.
 
-> **Auto-scan latency:** each scan compares two frames ~0.35 s apart and requires a newly seen line on **two consecutive scans** before writing it. At the default 5 s interval, expect roughly one to two scan intervals (5–10 s) between the lecturer typing a line and it landing, plus capture and AI time. This is deliberate: it prevents half-rendered frames and one-off OCR hallucinations from corrupting the file.
+> **Auto-scan latency:** each scan compares two frames ~0.35 s apart and requires a newly seen line on **two consecutive scans**. The line being typed at the bottom waits `active_line_hold_frames` extra scans, and an incomplete line is held until it is finished. At the default 5 s interval, expect roughly 10–15 s for that last line to land, plus capture and AI time; completed lines above it arrive sooner. Press `Ctrl + \` (or `Ctrl+3`) to bypass the hold and sync the current frame. This is deliberate: it prevents half-rendered frames and one-off OCR hallucinations from corrupting the file.
+
+### Development checks
+
+- Python: run `.venv\Scripts\python.exe -m pytest -q`. `pytest.ini` limits collection to `tests/` so scratch scripts that call Gemini are never collected.
+- VS Code extension: run `npm test` inside `ide_extension/vscode` (Node 20+; no editor required). It exercises the real HTTP bridge against a mocked `vscode` API.
+- CI: `.github/workflows/screenbot-tests.yml` runs both jobs for changes under `screen_bot/`, `tests/`, `ide_extension/`, and the workflow itself.
+
+These are contract and unit tests. They do not replace a recorded-lecture run or a real Visual Studio session; see `RISKS.md` for the remaining unautomated paths.
 
 ---
 
@@ -204,19 +224,19 @@ Set `"subject": "auto"` in `config.json` to let the extractor detect the languag
 Another app may have grabbed the same combination. Change it in `config.json` (e.g. `"hotkey": "ctrl+alt+a"`) and restart.
 
 **The code follower runs but my editor never changes.**
-Check `direct_file_sync` in `config.json`. When it is `true`, a file must be bound first: press `Ctrl+Shift+F` in VS Code/Antigravity or Visual Studio, or set a valid `target_file_path` for JetBrains/Eclipse/NetBeans/SSMS. ScreenBot then writes through a hash-checked adapter and deliberately sends **no keystrokes**. In the disk-based IDEs, save the file before syncing; if the editor did not reload a change written to disk, accept/reload it. If you want caret typing instead, set `direct_file_sync` to `false`.
+Check `direct_file_sync` in `config.json`. When it is `true`, a file must be bound first: press `Ctrl+Shift+F` in VS Code/Antigravity or Visual Studio, or set a valid `target_file_path` for JetBrains/Eclipse/NetBeans/SSMS. ScreenBot then writes through a hash-checked adapter and deliberately sends **no keystrokes**. For JetBrains/Eclipse/NetBeans/SSMS (and VS Code without the extension), the editor's saved state cannot be proven from its window title, so changes for an open file are queued instead of written. Save the file and accept the review item, or bind the file through the editor bridge. In the disk-based IDEs, save the file before syncing; if the editor did not reload a change written to disk, accept/reload it. If you want caret typing instead, set `direct_file_sync` to `false`.
 
 **The editor extension says "ScreenBot: waiting for app", or never connects.**
 Start ScreenBot first. The extension reads `%APPDATA%\ScreenBot\bridge.json`, which exists only while ScreenBot runs. For VS Code-family editors, confirm the extension folder is installed under that editor's extensions directory and fully restart the editor. `ScreenBot: Show Bridge Status` lists connected editor hosts. If the bridge port could not be bound, check `screen_bot.log`.
 
 **A change was held for review.**
-In the VS Code family, run `ScreenBot: Review Pending Code Changes` from the command palette. There is no review UI for other IDEs yet; the item is stored under `session_data/` and ScreenBot does not force it into your file. The hold reason (unsaved buffer, hash conflict, removed line, syntax gate, worsening diagnostics) is written to the log.
+In the VS Code family, run `ScreenBot: Review Pending Code Changes` from the command palette. The same review UI can resolve an item for a file from another editor by path. The hold reason is written to the log and shown in the item: unsaved buffer, saved state that could not be verified (JetBrains/Eclipse and similar), hash conflict, a line you deliberately removed, the syntax gate, or worsening diagnostics. An identical change is queued once, not on every scan, and a dismissed change is not queued again. For a disk-based editor, save/reload the file after accepting so its buffer matches the new disk content.
 
 **Code appears twice, or lands in the Teams/YouTube chat.**
 This was the old behaviour when Direct File Sync wrote the file *and* pasted at the same time. Both are now mutually exclusive: a successful file write always skips caret injection, and the paste path aborts unless the exact editor window captured at snapshot time is still focused and is not a browser/meeting window.
 
 **The live follower skips a line or waits.**
-By design: an unstable video frame is skipped, and a brand-new line must be seen on two consecutive scans before it is written. Press `Ctrl + \` (or `Ctrl+3`) to sync the current frame. `Ctrl+Shift+F` binds the focused editor file and syncs in one step.
+By design: an unstable video frame is skipped, a brand-new line must be seen on two consecutive scans, and the bottom line is held longer while it is still being typed. An incomplete line such as `int total =` is not delivered until it is finished or another line appears below it. Press `Ctrl + \` (or `Ctrl+3`) to bypass the hold and sync the current frame. `Ctrl+Shift+F` binds the focused editor file and syncs in one step.
 
 **Undo says it refused.**
 That is intentional. In Direct File Sync, undo proceeds only if the bound file still exactly matches the code ScreenBot last delivered; it will not overwrite edits you made after the last sync. In caret mode, undo restores ScreenBot's internal master only; use the editor's own undo for typed text.

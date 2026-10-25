@@ -1,9 +1,9 @@
 """
-Safe Injection Engine (Pipeline Stage 7):
-- Preserves and restores user clipboard atomically.
-- Verifies window focus, title, and process before and after injection.
-- Enforces modifier key release guard before paste.
-- Blocks placeholder tokens, sentinels, and overlapping paste operations.
+Safe Injection Engine (Pipeline Stage 7): QUARANTINED legacy helper.
+
+Only its clipboard/focus utilities survive for their unit tests. The unsafe
+select-all buffer read/write path was removed. The live bot does not import
+this module.
 """
 
 import time
@@ -97,72 +97,5 @@ class SafeInjector:
         for vk in (VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN):
             try:
                 user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
-            except Exception:
-                pass
-
-    def sync_and_inject_context_aware(self, raw_extracted_code: str, synchronizer=None, target_hwnd_checker=None) -> bool:
-        """
-        Context-aware buffer sync:
-        1. Saves original clipboard.
-        2. Releases held modifiers.
-        3. Reads existing IDE buffer via Ctrl+A -> Ctrl+C.
-        4. Merges and heals syntax via synchronizer.
-        5. Atomically replaces editor buffer (Ctrl+A -> Ctrl+V) only if changed & valid.
-        6. Restores original clipboard.
-        """
-        import keyboard
-        if target_hwnd_checker and not target_hwnd_checker():
-            return False
-
-        original_clipboard = ""
-        try:
-            original_clipboard = pyperclip.paste()
-        except Exception:
-            pass
-
-        try:
-            self.release_held_modifiers()
-            for mod in ("ctrl", "shift", "alt"):
-                try:
-                    keyboard.release(mod)
-                except Exception:
-                    pass
-
-            pyperclip.copy("")
-            keyboard.send("ctrl+a")
-            time.sleep(0.06)
-            keyboard.send("ctrl+c")
-            time.sleep(0.08)
-            current_ide_code = pyperclip.paste()
-
-            keyboard.send("right")
-
-            if not synchronizer:
-                try:
-                    from screen_bot.smart_context_engine import SmartCodeSynchronizer
-                except ModuleNotFoundError:
-                    from smart_context_engine import SmartCodeSynchronizer
-                synchronizer = SmartCodeSynchronizer(require_confirmations=2)
-
-            outcome = synchronizer.sync(current_ide_code, raw_extracted_code)
-            if not outcome.changed:
-                return False
-
-            if target_hwnd_checker and not target_hwnd_checker():
-                return False
-
-            pyperclip.copy(outcome.merged_text)
-            keyboard.send("ctrl+a")
-            time.sleep(0.05)
-            keyboard.send("ctrl+v")
-            time.sleep(0.08)
-            return True
-
-        except Exception:
-            return False
-        finally:
-            try:
-                time.sleep(0.05)
-                pyperclip.copy(original_clipboard)
             except Exception:
                 pass

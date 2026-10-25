@@ -1,7 +1,11 @@
 """
 smart_sync_engine.py
-Production-grade Context-Aware Code Merger, AST Syntax Healer, Active File Resolver,
-and Direct Disk Synchronizer for ScreenBot.
+QUARANTINED: not imported by the live bot.
+
+Legacy Context-Aware Code Merger, AST Syntax Healer, Active File Resolver, and
+Direct Disk Synchronizer. Its controller still mirrors editor buffers with
+Ctrl+A / Ctrl+C / Ctrl+V; never wire it back into the live path. All live
+delivery goes through editor_bridge / editor_adapters instead.
 """
 
 from __future__ import annotations

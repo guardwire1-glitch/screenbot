@@ -64,13 +64,28 @@ class Cfg:
 
 
 @dataclass
+class ReviewChange:
+    """A confirmed lecturer edit that was deliberately NOT applied to the master.
+
+    The live path passes allow_destructive=False, so replacements and deletions
+    must surface as reviewable changes instead of being dropped. `old`/`new` are
+    raw source lines (blank and structural lines included) for display.
+    """
+    old: List[str] = field(default_factory=list)
+    new: List[str] = field(default_factory=list)
+    kind: str = "edit"             # edit|delete|replacement
+
+
+@dataclass
 class Result:
     code: str
-    event: str = "noop"            # noop|insert|delete|modify|entity|rewrite|held|blocked|low_quality
+    event: str = "noop"            # noop|insert|delete|modify|entity|rewrite|review|held|blocked|low_quality
     inserted: List[str] = field(default_factory=list)
     removed: List[str] = field(default_factory=list)
     held: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    reviews: List[ReviewChange] = field(default_factory=list)
+    review_code: str = ""          # full document with held edits applied (review candidate)
 
     @property
     def changed(self) -> bool:
@@ -165,6 +180,8 @@ class DocMerger:
         self.lines: List[str] = []
         self.history: List[List[str]] = []
         self._pend: dict = {}
+        self._rev_pend: dict = {}
+        self._rev_seen: set = set()
         self._n = 0
         self._dframes: deque = deque(maxlen=10)
         self._freeze = 0
@@ -177,6 +194,8 @@ class DocMerger:
         """Load code that already exists in the file so it is never re-added."""
         self.lines = text.split("\n") if text else []
         self._pend.clear()
+        self._rev_pend.clear()
+        self._rev_seen.clear()
 
     def undo(self) -> bool:
         if not self.history:
@@ -211,12 +230,18 @@ class DocMerger:
             getattr(x, "visible", "full"), float(getattr(x, "confidence", 1.0))) for x in frame]
         ok = [self._ok(x) for x in fl]
         tx = [x.text if o else "" for x, o in zip(fl, ok)]
+        risky = bool(set(meta.flags) & RISKY_FLAGS)
         destr = (
             meta.allow_destructive
             and not meta.overlay
-            and not (set(meta.flags) & RISKY_FLAGS)
+            and not risky
             and self._n >= self._freeze
         )
+        # The live path passes allow_destructive=False. A trustworthy frame still
+        # describes a real lecturer edit, so it must surface as a review proposal
+        # instead of being silently skipped. Overlay/folded/wrapped frames stay
+        # ignored: their text is not reliable enough to propose a deletion.
+        review_ok = not meta.allow_destructive and not meta.overlay and not risky
         # A viewport line number of 1 is not proof that the file's first line is
         # on screen (OCR gutters restart at 1). Unknown means unknown: additions
         # are still allowed, deletions are not.
@@ -259,10 +284,32 @@ class DocMerger:
             run = []
 
         # 3) persistence gate -------------------------------------------------------
-        applied, newp = [], {}
+        applied, review, newp, newrp = [], [], {}, {}
+        seen_now = set()
         for c in ch:
-            if c[5] and not destr:
-                r.notes.append("destructive_skipped")
+            if c[5]:
+                if destr:
+                    cnt = self._pend.get(c[3], 0) + 1
+                    if cnt >= c[4]:
+                        applied.append(c)
+                    else:
+                        newp[c[3]] = cnt
+                elif review_ok:
+                    # A confirmed review is not applied to the master, so the same
+                    # observation arrives every frame. Remember it as confirmed
+                    # instead of making the proposal flicker in and out.
+                    if c[3] in self._rev_seen:
+                        review.append(c)
+                        seen_now.add(c[3])
+                        continue
+                    cnt = self._rev_pend.get(c[3], 0) + 1
+                    if cnt >= c[4]:
+                        review.append(c)
+                        seen_now.add(c[3])
+                    else:
+                        newrp[c[3]] = cnt
+                else:
+                    r.notes.append("destructive_skipped")
                 continue
             cnt = self._pend.get(c[3], 0) + 1
             if cnt >= c[4]:
@@ -270,12 +317,14 @@ class DocMerger:
             else:
                 newp[c[3]] = cnt
         self._pend = newp
+        self._rev_pend = newrp
+        self._rev_seen = seen_now
         r.held = held
-        if not applied:
-            r.event = "held" if (newp or held) else "noop"
+        if not applied and not review:
+            r.event = "held" if (newp or newrp or held) else "noop"
             return r
 
-        # 4) resolve overlaps, apply on a copy, check invariants --------------------
+        # 4) resolve overlaps, apply additive changes, hold edits for review -------
         applied.sort(key=lambda c: (not c[6], c[0]))
         cov, keep = [], []
         for c in applied:
@@ -284,33 +333,65 @@ class DocMerger:
             keep.append(c)
             if c[1] > c[0]:
                 cov.append((c[0], c[1]))
-        cand = list(self.lines)
+
+        review.sort(key=lambda c: (c[0], c[1]))
+        rev_cov, rev_keep = [], []
+        for c in review:
+            if any(c[0] < e and c[1] > s or s < c[0] < e for s, e in cov):
+                continue
+            if any(c[0] < e and c[1] > s or s < c[0] < e for s, e in rev_cov):
+                continue
+            rev_keep.append(c)
+            rev_cov.append((c[0], c[1]))
+
+        orig = list(self.lines)
+        cand = list(orig)
         for c in sorted(keep, key=lambda c: (c[0], c[1]), reverse=True):
             cand[c[0]:c[1]] = c[2]
-        keys = [k for k, _, _ in entities(cand)]
-        before, after = len(_strong(self.lines)), len(_strong(cand))
-        if len(keys) != len(set(keys)):
-            r.event, r.notes = "blocked", ["duplicate_declaration_blocked"]
-            return r
-        if before >= 5 and after < before * 0.4 and not any(c[4] >= cfg.req_rewrite for c in keep):
-            r.event, r.notes = "blocked", ["shrink_blocked"]
-            return r
-        removed = [x for c in keep for x in self.lines[c[0]:c[1]] if norm(x)]
-        if any(c[5] for c in keep):
-            self._dframes.append(self._n)
-            if len([n for n in self._dframes if n > self._n - 10]) > 4:
-                self._freeze = self._n + 20
-                r.notes.append("breaker_tripped")
-        self.history.append(list(self.lines))
-        del self.history[:-cfg.history]
-        self.lines = cand
+        if keep:
+            keys = [k for k, _, _ in entities(cand)]
+            before, after = len(_strong(orig)), len(_strong(cand))
+            if len(keys) != len(set(keys)):
+                r.event, r.notes = "blocked", ["duplicate_declaration_blocked"]
+                return r
+            if before >= 5 and after < before * 0.4 and not any(c[4] >= cfg.req_rewrite for c in keep):
+                r.event, r.notes = "blocked", ["shrink_blocked"]
+                return r
+            removed = [x for c in keep for x in orig[c[0]:c[1]] if norm(x)]
+            if any(c[5] for c in keep):
+                self._dframes.append(self._n)
+                if len([n for n in self._dframes if n > self._n - 10]) > 4:
+                    self._freeze = self._n + 20
+                    r.notes.append("breaker_tripped")
+                self.history.append(list(self.lines))
+            del self.history[:-cfg.history]
+            self.lines = cand
+        else:
+            removed = []
+
+        review_items: List[ReviewChange] = []
+        for c in rev_keep:
+            old = list(orig[c[0]:c[1]])
+            new = list(c[2])
+            kind = "replacement" if c[6] else ("deletion" if not any(norm(x) for x in new) else "edit")
+            review_items.append(ReviewChange(old=old, new=new, kind=kind))
+
         r.code = self.text
         r.inserted = [x for c in keep for x in c[2] if norm(x) and x not in removed]
         r.removed = [x for x in removed if x not in r.inserted]
-        r.event = ("rewrite" if any(c[6] and c[4] >= cfg.req_rewrite for c in keep) else
-                   "entity" if any(c[6] for c in keep) else
-                   "delete" if r.removed and not r.inserted else
-                   "modify" if r.removed else "insert")
+        r.reviews = review_items
+        if review_items:
+            rev_cand = list(orig)
+            for c in sorted(keep + rev_keep, key=lambda c: (c[0], c[1]), reverse=True):
+                rev_cand[c[0]:c[1]] = c[2]
+            r.review_code = "\n".join(rev_cand)
+        if not keep:
+            r.event = "review"
+        else:
+            r.event = ("rewrite" if any(c[6] and c[4] >= cfg.req_rewrite for c in keep) else
+                       "entity" if any(c[6] for c in keep) else
+                       "delete" if r.removed and not r.inserted else
+                       "modify" if r.removed else "insert")
         return r
 
     # ------------------------------------------------------------------
@@ -420,6 +501,111 @@ def apply_plan(target: str, steps) -> str:
             pos, new = s
             T[pos:pos] = new
     return "\n".join(T)
+
+
+def _normalized_lines(text: str) -> List[str]:
+    clean = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return clean.split("\n")
+
+
+def _line_positions(source: List[str], target: List[str]) -> dict:
+    """Map line indexes of `source` to their in-order matches in `target`."""
+    mapping = {}
+    matcher = difflib.SequenceMatcher(None, source, target, autojunk=False)
+    for a, b, size in matcher.get_matching_blocks():
+        for offset in range(size):
+            mapping[a + offset] = b + offset
+    return mapping
+
+
+def _has_block(lines: List[str], block: List[str]) -> bool:
+    if not block:
+        return True
+    size = len(block)
+    return any(lines[k:k + size] == block for k in range(len(lines) - size + 1))
+
+
+def plan_review_changes(base_master: str, review_master: str, target: str):
+    """Translate confirmed edits (base_master -> review_master) onto `target`.
+
+    Only a region whose old lines are still present unchanged in the target is
+    rewritten. If the user changed that region itself, nothing is proposed:
+    a human must merge it. Returns (proposed_text_or_None, problems).
+    """
+    if ([norm(x) for x in _normalized_lines(base_master)]
+            == [norm(x) for x in _normalized_lines(review_master)]):
+        return (target or ""), []
+    doc = _normalized_lines(base_master)
+    rev = _normalized_lines(review_master)
+    tgt = _normalized_lines(target)
+    doc_n = [norm(x) for x in doc]
+    rev_n = [norm(x) for x in rev]
+    tgt_n = [norm(x) for x in tgt]
+    d2t = _line_positions(doc_n, tgt_n)
+    edits, problems = [], []
+    matcher = difflib.SequenceMatcher(None, doc_n, rev_n, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        new = list(rev[j1:j2])
+        if i1 == i2:
+            if i1 == 0:
+                pos = d2t.get(0)
+                if pos is None and not any(tgt_n):
+                    pos = 0
+            else:
+                anchor = d2t.get(i1 - 1)
+                pos = anchor + 1 if anchor is not None else None
+            if pos is None:
+                problems.append(f"new lines cannot be anchored near line {i1 + 1}")
+            else:
+                edits.append((pos, pos, new))
+            continue
+        span = [d2t.get(idx) for idx in range(i1, i2)]
+        if any(pos is None for pos in span):
+            problems.append(f"edited lines {i1 + 1}-{i2} are not present unchanged in the file")
+            continue
+        if any(span[k + 1] != span[k] + 1 for k in range(len(span) - 1)):
+            problems.append(f"edited lines {i1 + 1}-{i2} have local edits in the file")
+            continue
+        edits.append((span[0], span[-1] + 1, new))
+    if problems:
+        return None, problems
+    out = list(tgt)
+    for start, end, new in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        out[start:end] = new
+    return "\n".join(out), []
+
+
+def review_state_present(base_master: str, review_master: str, target: str) -> bool:
+    """True when the target already embodies the lecture's edit.
+
+    Conservative: every removed strong line must be gone and every introduced
+    strong line present as a contiguous block. Used to resync after a human
+    accepts the review (the scan otherwise keeps re-detecting the same edit).
+    """
+    if ([norm(x) for x in _normalized_lines(base_master)]
+            == [norm(x) for x in _normalized_lines(review_master)]):
+        return False
+    doc_n = [norm(x) for x in _normalized_lines(base_master)]
+    rev_n = [norm(x) for x in _normalized_lines(review_master)]
+    tgt_n = [norm(x) for x in _normalized_lines(target)]
+    tgt_strong = [x for x in tgt_n if x and not weak(x)]
+    matcher = difflib.SequenceMatcher(None, doc_n, rev_n, autojunk=False)
+    saw_change = False
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        saw_change = True
+        old_strong = [x for x in doc_n[i1:i2] if x and not weak(x)]
+        new_strong = [x for x in rev_n[j1:j2] if x and not weak(x)]
+        if i1 < i2 and not old_strong:
+            return False       # cannot prove a weak-only deletion happened
+        if any(line in tgt_strong for line in old_strong):
+            return False       # still present somewhere: not the reviewed state
+        if new_strong and not _has_block(tgt_strong, new_strong):
+            return False
+    return saw_change
 
 
 class Registry:

@@ -28,7 +28,7 @@ except ImportError:
 
 try:
     from screen_bot.ai_vision_extractor import VisionExtractor
-    from screen_bot.smart_sync_engine import ScreenBotSmartController
+    from screen_bot.legacy.smart_sync_engine import ScreenBotSmartController
 except ModuleNotFoundError:
     from ai_vision_extractor import VisionExtractor
     from smart_sync_engine import ScreenBotSmartController

@@ -1,0 +1,49 @@
+name: ScreenBot tests
+
+on:
+  push:
+    paths:
+      - "screen_bot/**"
+      - "tests/**"
+      - "ide_extension/**"
+      - "pytest.ini"
+      - "ScreenBot.spec"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "screen_bot/**"
+      - "tests/**"
+      - "ide_extension/**"
+      - "pytest.ini"
+      - "ScreenBot.spec"
+      - ".github/workflows/**"
+
+jobs:
+  python:
+    # The app is Windows-only (ctypes.windll, keyboard, pyperclip, mss).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r screen_bot/requirements.txt pytest
+      - name: Run Python tests
+        run: python -m pytest -q
+
+  extension:
+    # The VS Code bridge is pure Node; no editor or display is needed here.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ide_extension/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run extension tests
+        run: npm test

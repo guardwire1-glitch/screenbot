@@ -10,7 +10,7 @@ Tests for Injection Safety (Pipeline Stage 7):
 import time
 import pytest
 import pyperclip
-from screen_bot.injector import SafeInjector, WindowFocusContext
+from screen_bot.legacy.injector import SafeInjector, WindowFocusContext
 from screen_bot.ai_vision_extractor import UNREADABLE_TOKEN
 
 

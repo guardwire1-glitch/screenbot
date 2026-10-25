@@ -64,15 +64,26 @@ RELIABILITY ARCHITECTURE (LIVE-CLASS PATH)
      * Visual Studio: Ctrl + Shift + F uses the DTE adapter when pywin32
        is installed. Without pywin32 the bind is refused because the
        active path is unknown; set "target_file_path" to use the saved
-       file instead.
+       file instead. The DTE adapter retries a missing or restarted
+       Visual Studio with a short backoff. Its edit replaces only the
+       changed line range and is recorded as ONE undo action, so a single
+       Ctrl+Z reverts the ScreenBot change without touching breakpoints
+       on other lines.
      * JetBrains, Eclipse, NetBeans, SSMS, and other disk-based editors:
        these expose only a filename in their window title, so ScreenBot
        will NOT guess a path. Set "target_file_path" to the exact saved
-       file in config.json and enable Direct File Sync. Save the file
-       before syncing.
-     * Every direct write is hash-checked, syntax-gated, and diagnostics-
-       gated (where diagnostics exist). The bot never types into Teams,
-       YouTube, or a meeting chat in this mode.
+       file in config.json and enable Direct File Sync. The file is
+       written automatically only when ScreenBot can PROVE the editor
+       buffer is saved. VS Code/Antigravity titles are trusted; JetBrains,
+       Eclipse, NetBeans, SSMS, and Notepad++ do not report saved state
+       reliably there, so a change for an open file in those editors is
+       queued for review instead. Save the file, accept the review item,
+       then reload it in the editor if needed. If no editor is running,
+       the file cannot have an unsaved buffer and the write is allowed.
+     * Every direct write is hash-checked, saved-state-gated for disk
+       editors, syntax-gated, and diagnostics-gated (where diagnostics
+       exist). The bot never types into Teams, YouTube, or a meeting chat
+       in this mode.
      * The editor may or may not auto-reload a file changed on disk.
        Reload it if prompted. Indentation comes from the merged document;
        optional formatting is off by default.
@@ -89,10 +100,14 @@ RELIABILITY ARCHITECTURE (LIVE-CLASS PATH)
      the AI call.
    - A brand-new line must be seen on two consecutive scans before it is
      written, so a one-off OCR hallucination cannot corrupt your file.
-   - At the default 5 s scan interval, expect roughly one to two scan
-     intervals (5-10 s) between the lecturer typing a line and it landing,
-     plus capture and AI time. Press Ctrl + \ (or Ctrl + 3) to sync the
-     current frame immediately.
+   - ACTIVE-LINE HOLD: the bottom-most line (the one still being typed)
+     waits "active_line_hold_frames" extra scans (default 2). An
+     incomplete line such as "int total =" or "if (ready)" is held until
+     it is finished or another line appears below it. Manual sync
+     bypasses this hold.
+   - At the default 5 s scan interval, expect roughly 10-15 s for that
+     last line, plus capture and AI time; lines above it arrive sooner.
+     Press Ctrl + \ (or Ctrl + 3) to sync the current frame immediately.
    - A vision answer older than "max_frame_age_seconds" (default 12 s) is
      discarded instead of applying outdated code.
 
@@ -103,6 +118,12 @@ RELIABILITY ARCHITECTURE (LIVE-CLASS PATH)
    - If the editor's error count increases after an apply, the change is
      rolled back and queued for review.
    - Re-adding a line the user deliberately deleted is refused and queued.
+   - Lecturer edits/replacements detected by the merge are never
+     auto-applied; they are queued for review.
+   - An identical held change is queued once, not once per scan, and a
+     dismissed proposal is not queued again.
+   - For disk-based editors, a saved state that cannot be verified counts
+     as "do not write" and is queued instead.
 
 6. STUCK-KEY PROTECTION (NO REBOOT REQUIRED)
    - Releases Ctrl/Shift/Alt/Win automatically at startup, after every
@@ -153,10 +174,11 @@ configurable in config.json.
 EDITOR BRIDGE (OPTIONAL, RECOMMENDED FOR VS CODE FAMILY)
 =======================================================================
 ScreenBot starts a localhost-only bridge while it runs and writes
-%APPDATA%\ScreenBot\bridge.json (token-protected). The optional extension
-in ide_extension/vscode supplies the exact buffer, diagnostics, hash-
-checked applies, and the pending-change review UI to VS Code,
-Antigravity, Cursor, and Windsurf.
+%APPDATA%\ScreenBot\bridge.json (token-protected). Every request must send
+the token in the X-ScreenBot-Token header; a token in the URL is rejected.
+The optional extension in ide_extension/vscode supplies the exact buffer,
+diagnostics, hash-checked applies, and the pending-change review UI to
+VS Code, Antigravity, Cursor, and Windsurf.
 
 Install it by copying ide_extension/vscode to:
   %USERPROFILE%\.vscode\extensions\screenbot.screenbot-editor-bridge-1.0.0
@@ -167,7 +189,9 @@ connected". Command palette commands:
   - ScreenBot: Review Pending Code Changes
 
 Without the extension, VS Code-family editors fall back to the disk
-adapter (saved files only) if used via target_file_path.
+adapter (saved files only) if used via target_file_path. The extension's
+own test suite runs with "npm test" in ide_extension/vscode; no editor is
+required.
 
 =======================================================================
 TRAY MENU CONTROLS (Right-click the monitor icon by the clock):
@@ -201,18 +225,26 @@ TROUBLESHOOTING:
   "hotkey" in config.json and restart.
 - Editor never changes -> Direct sync needs a bound target: Ctrl+Shift+F
   in VS Code/Visual Studio, or "target_file_path" in config.json for
-  JetBrains/Eclipse/NetBeans/SSMS. Save the file (disk-based IDEs) and
-  accept the editor's reload prompt if it asks.
+  JetBrains/Eclipse/NetBeans/SSMS. For those editors the saved state
+  cannot be verified from the window title, so a change for an open file
+  is queued instead of auto-written; save the file and accept the review
+  item. If no editor is running, the write is allowed. Reload the file in
+  the editor after accepting. Visual Studio reconnects automatically if
+  it was started or restarted after ScreenBot.
 - Code lands in chat/wrong app -> Fixed: a successful file write always
   skips caret injection, and caret mode aborts unless the original editor
   window still has focus and is not a browser/meeting window.
-- A line is skipped or delayed -> By design: unstable frames are skipped
-  and a new line must appear on two consecutive scans. Press Ctrl + \ to
-  sync the current frame immediately.
+- A line is skipped or delayed -> By design: unstable frames are skipped,
+  a new line must appear on two consecutive scans, and the bottom line is
+  held longer while it is being typed (an incomplete line is held until
+  it is finished). Press Ctrl + \ to bypass the hold and sync now.
 - "A change was held for review" -> VS Code family: run
-  "ScreenBot: Review Pending Code Changes". Other IDEs have no review UI
-  yet; the change is stored under session_data/ and is not forced into
-  the file.
+  "ScreenBot: Review Pending Code Changes" (it can also resolve an item
+  for another editor by path). Reasons include an unsaved buffer, saved
+  state that could not be verified, a hash conflict, a line you removed,
+  a syntax failure, or worsening diagnostics. The same change is queued
+  once, not every scan. For disk-based editors, save/reload after
+  accepting. The item is stored under session_data/ until resolved.
 - Undo refused -> The bound file contains newer user edits, so ScreenBot
   left them untouched. In caret mode undo only restores the internal
   master.

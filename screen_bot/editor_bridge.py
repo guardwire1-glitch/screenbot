@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 BRIDGE_VERSION = 1
 DEFAULT_PORT = 47653
@@ -324,10 +324,9 @@ class BridgeServer:
                 return
 
             def _auth(self) -> bool:
+                # Header only. A token in the query string leaks through
+                # proxies, logs, and browser history, so it is never accepted.
                 supplied = self.headers.get("X-ScreenBot-Token", "")
-                if not supplied:
-                    query = parse_qs(urlparse(self.path).query)
-                    supplied = (query.get("token") or [""])[0]
                 return secrets.compare_digest(supplied, server.token)
 
             def _send(self, status: int, data: Optional[dict] = None) -> None:
@@ -368,6 +367,14 @@ class BridgeServer:
                     return
                 if path == "/v1/pending":
                     self._send(200, {"items": server.pending.summaries()})
+                    return
+                if path.startswith("/v1/pending/"):
+                    item_id = path[len("/v1/pending/"):].strip("/")
+                    item = server.pending.get(item_id) if item_id else None
+                    if item is None:
+                        self._send(404, {"error": "pending change not found"})
+                        return
+                    self._send(200, {"item": asdict(item)})
                     return
                 self._send(404, {"error": "not found"})
 

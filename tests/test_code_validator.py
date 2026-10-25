@@ -11,6 +11,7 @@ from screen_bot.code_validator import (
     normalize_for_diff,
     LineConsensusTracker,
     is_valid_code_line,
+    looks_incomplete,
     validate_syntax,
 )
 from screen_bot.ai_vision_extractor import ExtractedLine, UNREADABLE_TOKEN
@@ -75,6 +76,88 @@ def test_repeated_lines_in_same_frame_never_advance_count_to_accepted():
     # A line seen once in Frame 1 MUST NOT reach accepted, even if repeated!
     assert len(accepted1) == 0, f"Expected 0 accepted on frame 1, but got {len(accepted1)}: {[l.text for l in accepted1]}"
     assert len(pending1) == 2
+
+
+def _line(no: int, text: str) -> ExtractedLine:
+    return ExtractedLine(
+        line_no=no, text=text, indent_width=0, visible="full", confidence=0.95
+    )
+
+
+def test_active_line_hold_waits_extra_frames_for_balanced_final_line():
+    tracker = LineConsensusTracker(
+        required_observations=2, min_confidence=0.85, active_line_hold_frames=2
+    )
+    frame = [_line(1, "int x = 1;"), _line(2, "int y = 2;")]
+
+    first, _ = tracker.feed_frame_lines(frame, hold_active_line=True)
+    assert [l.text for l in first] == []
+    second, pending = tracker.feed_frame_lines(frame, hold_active_line=True)
+    assert [l.text for l in second] == ["int x = 1;"]
+    assert [l.text for l in pending] == ["int y = 2;"]
+    third, pending = tracker.feed_frame_lines(frame, hold_active_line=True)
+    assert [l.text for l in third] == ["int x = 1;"]
+    assert [l.text for l in pending] == ["int y = 2;"]
+    fourth, pending = tracker.feed_frame_lines(frame, hold_active_line=True)
+    assert [l.text for l in fourth] == ["int x = 1;", "int y = 2;"]
+    assert pending == []
+
+
+def test_active_line_hold_releases_when_a_line_appears_below():
+    tracker = LineConsensusTracker(
+        required_observations=2, min_confidence=0.85, active_line_hold_frames=10
+    )
+    first = [_line(1, "int a = 1;")]
+    tracker.feed_frame_lines(first, hold_active_line=True)
+    _, pending = tracker.feed_frame_lines(first, hold_active_line=True)
+    assert [l.text for l in pending] == ["int a = 1;"]   # still the caret line
+
+    second = [_line(1, "int a = 1;"), _line(2, "int b = 2;")]
+    accepted, pending = tracker.feed_frame_lines(second, hold_active_line=True)
+    assert [l.text for l in accepted] == ["int a = 1;"]
+    assert [l.text for l in pending] == ["int b = 2;"]
+
+
+def test_active_line_hold_exempts_structural_closers():
+    tracker = LineConsensusTracker(
+        required_observations=2, min_confidence=0.85, active_line_hold_frames=10
+    )
+    frame = [_line(1, "int x = 1;"), _line(2, "}")]
+    tracker.feed_frame_lines(frame, hold_active_line=True)
+    accepted, pending = tracker.feed_frame_lines(frame, hold_active_line=True)
+    assert [l.text for l in accepted] == ["int x = 1;", "}"]
+    assert pending == []
+
+
+def test_incomplete_caret_line_is_never_admitted_automatically():
+    tracker = LineConsensusTracker(
+        required_observations=2, min_confidence=0.85, active_line_hold_frames=2
+    )
+    frame = [_line(1, "int x = 1;"), _line(2, "int total =")]
+
+    for _ in range(8):
+        accepted, pending = tracker.feed_frame_lines(frame, hold_active_line=True)
+        assert "int total =" not in [l.text for l in accepted]
+        assert "int total =" in [l.text for l in pending]
+
+    # The user pressed the manual/force hotkey: normal consensus applies.
+    accepted, _ = tracker.feed_frame_lines(frame, hold_active_line=False)
+    assert "int total =" in [l.text for l in accepted]
+
+
+def test_looks_incomplete_distinguishes_typed_code_from_finished_lines():
+    assert looks_incomplete("int total =")
+    assert looks_incomplete('System.out.print("Hello')
+    assert looks_incomplete("foo(")
+    assert looks_incomplete("if (ready)")
+    assert looks_incomplete("public void F() {")
+    assert looks_incomplete("return")
+    assert looks_incomplete("value = a +")
+    assert not looks_incomplete("int total = 0;")
+    assert not looks_incomplete("System.out.println(\"Hello\");")
+    assert not looks_incomplete("}")
+    assert not looks_incomplete("// a comment being typed")
+    assert not looks_incomplete("")
 
 
 def test_blank_lines_require_two_consecutive_frames_to_accept():

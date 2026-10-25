@@ -11,6 +11,9 @@
   "categories": ["Other"],
   "activationEvents": ["onStartupFinished"],
   "main": "./extension.js",
+  "scripts": {
+    "test": "node --test test/extension.test.js"
+  },
   "contributes": {
     "commands": [
       {

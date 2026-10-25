@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "screen_bot"))
 
-from editor_bridge import BridgeServer, NoEditorHost, discovery_path
+from editor_bridge import BridgeServer, NoEditorHost, PendingChange, discovery_path
 
 
 @pytest.fixture
@@ -79,6 +79,24 @@ def test_data_endpoints_require_the_token(bridge):
     assert data["ok"] is True
 
 
+def test_token_in_query_string_is_never_accepted(bridge):
+    """Only the header is trusted; URLs leak into logs and browser history."""
+    status, _ = _request(
+        bridge, "GET", "/v1/pending?token=test-token", token=None
+    )
+    assert status == 401
+
+    status, _ = _request(
+        bridge, "GET", "/v1/pending?token=test-token", token="wrong-token"
+    )
+    assert status == 401
+
+    status, _ = _request(
+        bridge, "GET", "/v1/pending?token=wrong-token", token="test-token"
+    )
+    assert status == 200
+
+
 def test_jobs_are_routed_only_to_the_requested_ide(bridge):
     outcome = {}
 
@@ -127,6 +145,37 @@ def test_timed_out_job_is_never_left_in_the_queue(bridge):
     )
     assert status == 204
     assert bridge._jobs == []
+
+
+def test_pending_detail_returns_the_full_proposal(bridge):
+    """The review diff needs the proposed text, which the list omits."""
+    item = bridge.pending.add(
+        PendingChange(
+            id="pc_detail",
+            created_at=time.time(),
+            file_path="C:/work/Demo.cs",
+            base_hash="abc123",
+            proposed_text="class Demo\n{\n    int x = 2;\n}\n",
+            reason="lecturer 1 edited block(s)",
+            source="disk",
+        )
+    )
+
+    status, listing = _request(bridge, "GET", "/v1/pending")
+    assert status == 200
+    assert listing["items"] == [item.summary()]
+    assert "proposed_text" not in listing["items"][0]
+
+    status, data = _request(bridge, "GET", "/v1/pending/pc_detail")
+    assert status == 200
+    assert data["item"]["proposed_text"] == item.proposed_text
+    assert data["item"]["base_hash"] == "abc123"
+
+    status, _ = _request(bridge, "GET", "/v1/pending/pc_missing")
+    assert status == 404
+
+    status, _ = _request(bridge, "GET", "/v1/pending/pc_detail", token=None)
+    assert status == 401
 
 
 def test_pending_changes_resolve_through_the_registered_resolver(bridge):
