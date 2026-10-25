@@ -12,22 +12,49 @@ that would break a file that was previously clean.
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from .code_validator import validate_syntax
 except ImportError:
     from code_validator import validate_syntax
 
-try:
-    from tree_sitter import Language, Parser
-    import tree_sitter_c_sharp as ts_csharp
-    import tree_sitter_java as ts_java
-    import tree_sitter_python as ts_python
-    HAS_TREE_SITTER = True
-except ImportError:
-    HAS_TREE_SITTER = False
+_GRAMMAR_MODULES = {
+    "csharp": "tree_sitter_c_sharp",
+    "java": "tree_sitter_java",
+    "python": "tree_sitter_python",
+}
+
+
+def _optional_import(name: str) -> Any:
+    try:
+        return importlib.import_module(name)
+    except Exception:
+        return None
+
+
+def _load_tree_sitter() -> Tuple[Any, Dict[str, Any]]:
+    """Load the parser core and each grammar independently.
+
+    A missing or broken grammar must never disable the languages whose parser
+    is installed.
+    """
+    core = _optional_import("tree_sitter")
+    if core is None or not hasattr(core, "Language") or not hasattr(core, "Parser"):
+        return None, {}
+    grammars = {}
+    for language, module_name in _GRAMMAR_MODULES.items():
+        module = _optional_import(module_name)
+        if module is not None:
+            grammars[language] = module
+    return core, grammars
+
+
+_TS_CORE, _GRAMMARS = _load_tree_sitter()
+HAS_TREE_SITTER = bool(_GRAMMARS)
+AVAILABLE_GRAMMARS = frozenset(_GRAMMARS)
 
 _ALIASES = {
     "cs": "csharp", "c#": "csharp", "c_sharp": "csharp", "csharp": "csharp",
@@ -42,22 +69,16 @@ _PARSERS = {}
 
 def _grammar(language: str):
     lang = _ALIASES.get((language or "").lower(), (language or "").lower())
-    if not HAS_TREE_SITTER:
+    if _TS_CORE is None:
         return None
     if lang in _PARSERS:
         return _PARSERS[lang]
-    pointer = None
-    if lang == "csharp":
-        pointer = ts_csharp.language()
-    elif lang == "java":
-        pointer = ts_java.language()
-    elif lang == "python":
-        pointer = ts_python.language()
-    if pointer is None:
+    module = _GRAMMARS.get(lang)
+    if module is None:
         _PARSERS[lang] = None
         return None
     try:
-        _PARSERS[lang] = Parser(Language(pointer))
+        _PARSERS[lang] = _TS_CORE.Parser(_TS_CORE.Language(module.language()))
     except Exception:
         _PARSERS[lang] = None
     return _PARSERS[lang]

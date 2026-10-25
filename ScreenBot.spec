@@ -6,7 +6,12 @@ a = Analysis(
     pathex=['screen_bot'],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=[
+        'tree_sitter',
+        'tree_sitter_c_sharp',
+        'tree_sitter_java',
+        'tree_sitter_python',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

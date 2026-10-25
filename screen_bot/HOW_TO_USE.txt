@@ -113,7 +113,9 @@ RELIABILITY ARCHITECTURE (LIVE-CLASS PATH)
 
 5. EDITOR-SAFE SYNTAX / DIAGNOSTICS GATE
    - The full proposed document is syntax-checked (tree-sitter for
-     C#/Java/Python, delimiter scanner otherwise).
+     C#/Java/Python, delimiter scanner otherwise). Each grammar is
+     optional and loaded independently, so a missing grammar only
+     downgrades that language, not all of them.
    - A change that adds parser errors is queued, not applied.
    - If the editor's error count increases after an apply, the change is
      rolled back and queued for review.

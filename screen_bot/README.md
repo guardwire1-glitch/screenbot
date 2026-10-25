@@ -139,6 +139,8 @@ A direct apply happens only when:
 
 Otherwise the change is queued for review or discarded, and ScreenBot does not advance its master. Compatible new lecture lines can still be applied when unrelated user code differs; the conflicting part is queued. An identical held change is queued only once, and an explicitly dismissed proposal is not queued again on the next scan.
 
+Syntax checking uses tree-sitter for C#, Java, and Python. Each grammar is optional and loaded independently: if one grammar is missing or broken, only that language falls back to the delimiter scanner. The grammar packages are listed in `screen_bot/requirements.txt` and bundled by `ScreenBot.spec`.
+
 Indentation comes from the merged document, and ScreenBot preserves the file's existing CRLF/LF style. It does not silently reformat your file. To run the editor's formatter after an apply, set `format_on_apply` to `true` in ScreenBot's config, or enable the `screenbot.formatOnApply` setting in the VS Code-family extension. Formatting the whole file can move code you did not touch.
 
 ---
