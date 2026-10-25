@@ -20,7 +20,7 @@ import logging
 import threading
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import ctypes
 from ctypes import wintypes
 
