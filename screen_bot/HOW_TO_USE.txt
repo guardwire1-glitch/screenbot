@@ -1,5 +1,5 @@
 =======================================================================
-             SCREENBOT PRO - TOYOTA-GRADE STANDALONE VERSION
+             SCREENBOT PRO - STANDALONE VERSION
 =======================================================================
 
 HOW TO RUN:
@@ -12,12 +12,14 @@ HOW TO RUN:
 3. Double-click "ScreenBot.exe" (or "START_SCREENBOT.bat").
    * NO Python installation is required!
    * Works on any Windows 10/11 machine.
-4. A small "ScreenBot is running" badge appears in the bottom-right corner
-   for 60 seconds (NO beep). It shows the current language and Auto-Scan
-   state. Click the badge to dismiss it early, or show it again from the
-   tray menu -> "Show Running Badge (60s)". The tray icon stays active.
-   The automatic 5-second scanner is OFF by default. Press Ctrl + Alt + \ to
-   start it when a lecture begins, and the same keys to pause it.
+4. A separate notification-area status icon reports that ScreenBot is
+   running, with the current language and Auto-Scan state. It stays while
+   ScreenBot runs and disappears when ScreenBot exits; it is not a
+   60-second popup. Startup and hotkey beeps are controlled by the
+   "sound_feedback" setting (on in the built-in defaults; set it to false
+   to mute).
+   Auto-scan starts automatically only when "auto_scan_enabled" is true
+   in your config. Press Ctrl + Alt + \ to start or pause it at any time.
 
 WHERE IS MY API KEY STORED?
 ---------------------------
@@ -27,63 +29,87 @@ ScreenBot resolves the key in this order (first NON-BLANK value wins):
   3. %APPDATA%\ScreenBot\config.json   <-- SETUP.bat writes here
   4. config.json next to ScreenBot.exe
 
-A blank value never overrides a real one, so the empty config.json in
-this folder can never wipe the key you saved on your own PC.
+A blank value never overrides a real one, so a blank template cannot wipe
+the key you saved on your own PC.
 
-Do NOT paste your key into the config.json or .env inside this folder:
-those files are the ones that get zipped and shared with your friends.
+Do NOT paste your key into the config.json or .env inside a folder you
+share. In this working repository both files are gitignored because they
+can hold a real key; never commit, zip, or share them while populated.
 
 =======================================================================
-TOYOTA-GRADE RELIABILITY ARCHITECTURE (ZERO-SLOP, INDESTRUCTIBLE)
+RELIABILITY ARCHITECTURE (LIVE-CLASS PATH)
 =======================================================================
 
-ScreenBot has been upgraded with industrial-grade reliability:
+1. LOCAL PIXEL GATE
+   - A local pixel diff runs before every AI call. If the lecture video is
+     static (speaking, drinking water, showing a slide without typing),
+     ScreenBot skips the cloud call and spends no quota.
+   - Pending consensus lines always force a scan even when the frame looks
+     static, so a line is never stranded.
 
-1. LOCAL PIXEL GATEKEEPER (Zero Wasted Cloud Calls)
-   - Every 5s, ScreenBot runs a 3ms local pixel diff on the lecture video.
-   - If the lecturer is speaking, drinking water, or explaining slides without
-     typing, ScreenBot stays 100% silent (0 network lag, 0 API quota wasted,
-     0 hallucinated formatting diffs).
+2. APPEND-ONLY CONVERGENCE
+   - Lines that scroll off-screen are treated as unseen, not deleted.
+     Scrolling cannot erase code already delivered.
+   - Lines already present in the file are never typed again. Repeated
+     frames are idempotent.
+   - Destructive rewrites are disabled on the live path; conflicting user
+     code is held for review instead of overwritten.
 
-2. SCROLL-IMMUNE CONVERGENCE ENGINE
-   - When the lecturer scrolls down (e.g. top lines scroll off screen):
-     ScreenBot anchors to the overlapping lines, preserves the entire file,
-     and only appends the new lines at the bottom!
-   - When the lecturer scrolls back up to line 1 to explain something:
-     ScreenBot recognizes that line 1 is already in the file, and injects 0 lines!
-
-3. DUAL ACTUATION: DIRECT FILE SYNC vs SMART CARET MODE
-   - DIRECT FILE SYNC (Press Ctrl + Shift + F):
-     * Press Ctrl + Shift + F while in your code editor (VS Code, IntelliJ, etc.).
-     * ScreenBot binds directly to the active source file (e.g. Vehicle.java).
-     * Code writes directly to disk with ZERO simulated keystrokes. In this mode
-       ScreenBot never types into the foreground window at all, so it cannot
-       accidentally paste code into Teams, YouTube, or a meeting chat.
-     * Your IDE automatically reloads the file with 100% native formatting,
-       perfect indentation, and zero cursor fighting! Accept the "file changed
-       on disk" reload if your editor asks.
-   - SMART CARET MODE (set "direct_file_sync": false in config.json):
-     * If no local file is bound, ScreenBot pastes cleanly at your cursor.
-     * Before every paste it re-checks that the window captured at snapshot time
-       still has focus, and refuses to paste into a browser or meeting window.
-     * Guaranteed clean indentation via text dedenting.
-     * Strictly ends with newline (\n) so cursor advances automatically.
+3. TWO DELIVERY MODES
+   DIRECT FILE SYNC (zero keystrokes):
+     * VS Code, Antigravity, Cursor, Windsurf: press Ctrl + Shift + F in
+       the editor. ScreenBot binds the exact active file through the
+       ScreenBot Editor Bridge extension and writes its real buffer,
+       including unsaved edits.
+     * Visual Studio: Ctrl + Shift + F uses the DTE adapter when pywin32
+       is installed. Without pywin32 the bind is refused because the
+       active path is unknown; set "target_file_path" to use the saved
+       file instead.
+     * JetBrains, Eclipse, NetBeans, SSMS, and other disk-based editors:
+       these expose only a filename in their window title, so ScreenBot
+       will NOT guess a path. Set "target_file_path" to the exact saved
+       file in config.json and enable Direct File Sync. Save the file
+       before syncing.
+     * Every direct write is hash-checked, syntax-gated, and diagnostics-
+       gated (where diagnostics exist). The bot never types into Teams,
+       YouTube, or a meeting chat in this mode.
+     * The editor may or may not auto-reload a file changed on disk.
+       Reload it if prompted. Indentation comes from the merged document;
+       optional formatting is off by default.
+   SMART CARET MODE (set "direct_file_sync": false in config.json):
+     * Pastes at your cursor only when the exact editor window captured at
+       snapshot time still has focus and is not a browser/meeting window.
+     * The payload is dedented and ends with a newline.
+     * Ctrl + Alt + Z in this mode restores ScreenBot's internal master
+       only; use the editor's own undo for typed text.
 
 4. TWO-FRAME STABILITY + TWO-READ CONFIRMATION
-   - Each scan grabs two frames ~400ms apart. If the video is still buffering,
-     scrolling, or mid-keyframe, the frame is discarded instead of being sent
-     to the AI (no more half-rendered or duplicated lines).
+   - Each scan compares two frames ~350 ms apart. If the video is
+     buffering, scrolling, or mid-keyframe, the frame is discarded before
+     the AI call.
    - A brand-new line must be seen on two consecutive scans before it is
      written, so a one-off OCR hallucination cannot corrupt your file.
-   - Expect roughly 10 seconds between the lecturer typing a line and it
-     landing in your file. Press Ctrl + Shift + F to force an immediate sync.
+   - At the default 5 s scan interval, expect roughly one to two scan
+     intervals (5-10 s) between the lecturer typing a line and it landing,
+     plus capture and AI time. Press Ctrl + \ (or Ctrl + 3) to sync the
+     current frame immediately.
+   - A vision answer older than "max_frame_age_seconds" (default 12 s) is
+     discarded instead of applying outdated code.
 
-5. STUCK-KEY PROTECTION (NO REBOOT REQUIRED)
-   - Released Ctrl/Shift/Alt/Win automatically at startup, after every hotkey,
-     and on exit, so a swallowed key-up cannot turn later clicks into
-     Ctrl+clicks (new links/windows) or Ctrl+drags (duplicates).
+5. EDITOR-SAFE SYNTAX / DIAGNOSTICS GATE
+   - The full proposed document is syntax-checked (tree-sitter for
+     C#/Java/Python, delimiter scanner otherwise).
+   - A change that adds parser errors is queued, not applied.
+   - If the editor's error count increases after an apply, the change is
+     rolled back and queued for review.
+   - Re-adding a line the user deliberately deleted is refused and queued.
+
+6. STUCK-KEY PROTECTION (NO REBOOT REQUIRED)
+   - Releases Ctrl/Shift/Alt/Win automatically at startup, after every
+     hotkey, and on exit, so a swallowed key-up cannot turn later clicks
+     into Ctrl+clicks (new links/windows) or Ctrl+drags (duplicates).
    - A watchdog also catches a modifier held for more than 25 seconds.
-   - Emergency recovery: fix_stuck_keys.bat (works without ScreenBot running).
+   - Emergency recovery: fix_stuck_keys.bat (works without ScreenBot).
 
 =======================================================================
 HOTKEYS & CONTROLS:
@@ -92,82 +118,113 @@ ANSWER HOTKEYS:
 - Ctrl + 0              : DIRECT ANSWER (concise, copied to clipboard)
 - Ctrl + 9              : EXPLAINED ANSWER (answer + short rationale)
 - Ctrl + 8              : PARAPHRASE (rewrite in your own words)
-- Ctrl + 2              : EXAM HIGHLIGHT & SOLVE (also Ctrl+Shift+V, Ctrl+7)
+- Ctrl + 2              : EXAM HIGHLIGHT & SOLVE
+                          (also Ctrl+Shift+V, Ctrl+Alt+V, Ctrl+7)
 
 LIVE CODE FOLLOWER HOTKEYS:
-- Ctrl + Shift + F      : SYNC LECTURE CODE (writes bound file, or caret if
-                          direct_file_sync is off)
-                           (also Ctrl + \ or Ctrl + 3)
-- Ctrl + \ (or Ctrl + 3): MANUAL SYNC NOW (syncs new lines instantly)
-- Ctrl + Shift + \      : FORCE FULL RE-SYNC (re-syncs entire file from line 1)
+- Ctrl + \ (or Ctrl + 3): SYNC NEW LECTURE LINES NOW
+- Ctrl + Shift + F      : BIND the exact active file and sync
+                          (VS Code family / Visual Studio; suppressed so
+                          the editor's Find-in-Files does not open)
+- Ctrl + Shift + \      : FORCE FULL RE-SYNC
 - Ctrl + Alt + \        : PAUSE / RESUME AUTO-SCAN
-- Ctrl + 4              : AI LECTURE NOTE-TAKER (Slides to Cornell Study Notes)
+- Ctrl + 4              : AI LECTURE NOTE-TAKER (Slides to Cornell notes)
 
 OTHER:
-- ESC                   : EMERGENCY STOP (halts typing / running action at once)
-- Ctrl + Alt + Z        : UNDO LAST CODE EDIT (up to 20 saved snapshots)
-- Ctrl + Shift + Q      : EXIT SCREENBOT
+- ESC / Ctrl + Shift + X: EMERGENCY STOP (halts typing/action)
+- Ctrl + Alt + Z        : UNDO LAST CODE EDIT (see limits above)
+- Ctrl + Shift + Q      : EXIT SCREENBOT (also Ctrl + Alt + Esc)
 
 LIVE CODE FOLLOWER LANGUAGES:
-- "subject": "auto" (default) detects the language from the code on screen
-  and from the active file extension.
+- "subject": "auto" lets the extractor detect the language from the code
+  on screen. The built-in default is "java"; set "auto" explicitly (or
+  pin a language) in config.json.
 - Supported: Java, C, C++, C#, Python, JavaScript/TypeScript, PHP, Ruby,
   Go, Rust, Kotlin, Swift, SQL, HTML/CSS, and shell scripts.
-- Pin a language anytime: tray menu -> Subject Preset.
-- ScreenBot never translates code into a different language: it transcribes
-  and writes exactly the language shown.
+- The tray menu -> Subject Preset can pin Java SE/OOP, Advanced Java, C,
+  SQL, or Web. For any other supported language, set "subject" in
+  config.json to one of the names above.
+- ScreenBot never translates code: it transcribes the language shown.
 
-Typing speed for the highlight-and-solve typer is 60 WPM by default and is
-configurable with the "typing_wpm" setting.
+The highlight-and-solve typing speed defaults to "typing_wpm": 38 and is
+configurable in config.json.
 
 =======================================================================
-TRAY MENU CONTROLS (Right-click blue monitor icon by the clock):
+EDITOR BRIDGE (OPTIONAL, RECOMMENDED FOR VS CODE FAMILY)
 =======================================================================
-- [✓] Direct File Sync (Zero Keystrokes) : Writes straight to disk file.
-- Bind Active Editor File (Ctrl+Shift+F) : Binds current focused file.
-- [✓] Auto-Scan Live Coding (5s interval): Toggle continuous scanning.
-- Show Running Badge (60s)               : Re-show the visual "running" card.
-- Release Stuck Keys (Ctrl/Shift/Alt)    : Restores normal clicking instantly.
-- Class Mode Injection: Instant Paste vs Turbo Keystrokes.
-- Typing Speed (WPM) / Subject Preset / Exit ScreenBot.
-  Subject Preset includes Auto-Detect (all languages), Java, Advanced Java,
-  C#, C, C++, Python, JavaScript/TypeScript, Web, SQL, PHP, Ruby, Go, Rust,
-  Kotlin, and Swift.
+ScreenBot starts a localhost-only bridge while it runs and writes
+%APPDATA%\ScreenBot\bridge.json (token-protected). The optional extension
+in ide_extension/vscode supplies the exact buffer, diagnostics, hash-
+checked applies, and the pending-change review UI to VS Code,
+Antigravity, Cursor, and Windsurf.
+
+Install it by copying ide_extension/vscode to:
+  %USERPROFILE%\.vscode\extensions\screenbot.screenbot-editor-bridge-1.0.0
+  (%USERPROFILE%\.antigravity\extensions\... for Antigravity)
+then restart the editor. The status bar shows "ScreenBot: bridge
+connected". Command palette commands:
+  - ScreenBot: Show Bridge Status
+  - ScreenBot: Review Pending Code Changes
+
+Without the extension, VS Code-family editors fall back to the disk
+adapter (saved files only) if used via target_file_path.
+
 =======================================================================
+TRAY MENU CONTROLS (Right-click the monitor icon by the clock):
+=======================================================================
+- Solve Screen / Explain / Paraphrase
+- Type Answer / Solve Highlighted
+- Sync New Lines Now (Ctrl+\)
+- Force Full Re-Sync (Ctrl+Shift+\)
+- [toggle] Direct File Sync (Zero Keystrokes)
+- Bind Active Editor File (Ctrl+Shift+F)
+- [toggle] Auto-Scan Live Coding (5s interval)
+- Lecture Note-Taker / Slides (Ctrl+4)
+- Emergency Stop Typing (ESC)
+- Typing Speed (WPM): Dynamic, Relaxed, Fast, Turbo
+- Class Mode Injection: Instant Paste vs Turbo Keystrokes
+- [toggle] Auto-Type on Solve
+- Subject Preset: Java SE/OOP, Advanced Java, C, SQL, Web
+- Open Settings (config.json), View Logs, Exit ScreenBot
 
 =======================================================================
 TROUBLESHOOTING:
 =======================================================================
 - "GEMINI_API_KEY is not set." -> Run check_status.bat to see which tier
   the key came from. If none, run SETUP.bat and paste your key.
-- No tray icon                -> It may be in the overflow area next to
-                                  the clock. Run check_status.bat.
-- Hotkey does nothing         -> Another app owns that combination. Change
-                                  "hotkey" in config.json and restart.
-- Editor never changes        -> With "direct_file_sync": true the code is
-                                  written to target_file_path with zero
-                                  keystrokes. Accept the editor's reload prompt,
-                                  or set "direct_file_sync": false to paste.
-- Code lands in chat/wrong app -> Fixed: a successful file write now always
-                                  skips caret injection, and caret mode aborts
-                                  unless the original editor window still has
-                                  focus and is not a browser/meeting window.
-- A line is skipped or delayed -> By design: unstable frames are skipped and a
-                                  new line must appear twice before it is
-                                  written. Press Ctrl + Shift + F to force it.
-- Clicks open links/new windows  -> A "stuck Ctrl" key. Run fix_stuck_keys.bat
-  or duplicate items                (or tray menu -> Release Stuck Keys).
-                                    No reboot needed. ScreenBot now also does
-                                    this automatically on startup, after every
-                                    hotkey, on exit, and after 25s of a held
-                                    modifier.
-- Auto-scan pauses / log says 429 -> Gemini free-tier rate limit. ScreenBot
-                                    pauses AI calls for 45s, then resumes.
-- No beep on startup          -> Intentional. The 60-second "ScreenBot is
-                                  running" badge is the visual replacement.
-                                  Re-show it from the tray menu.
-- Wrong language written      -> Keep "subject": "auto" in config.json, or
-                                  pick the language in tray -> Subject Preset.
-                                  The follower never translates languages.
-- "running directly from ZIP"  -> Extract the archive first.
+- No tray icon -> It may be in the overflow area next to the clock.
+  Run check_status.bat.
+- Editor extension says "waiting for app" -> Start ScreenBot first; the
+  discovery file exists only while it runs. Restart the editor after
+  installing the extension.
+- Hotkey does nothing -> Another app owns that combination. Change
+  "hotkey" in config.json and restart.
+- Editor never changes -> Direct sync needs a bound target: Ctrl+Shift+F
+  in VS Code/Visual Studio, or "target_file_path" in config.json for
+  JetBrains/Eclipse/NetBeans/SSMS. Save the file (disk-based IDEs) and
+  accept the editor's reload prompt if it asks.
+- Code lands in chat/wrong app -> Fixed: a successful file write always
+  skips caret injection, and caret mode aborts unless the original editor
+  window still has focus and is not a browser/meeting window.
+- A line is skipped or delayed -> By design: unstable frames are skipped
+  and a new line must appear on two consecutive scans. Press Ctrl + \ to
+  sync the current frame immediately.
+- "A change was held for review" -> VS Code family: run
+  "ScreenBot: Review Pending Code Changes". Other IDEs have no review UI
+  yet; the change is stored under session_data/ and is not forced into
+  the file.
+- Undo refused -> The bound file contains newer user edits, so ScreenBot
+  left them untouched. In caret mode undo only restores the internal
+  master.
+- Clicks open links/new windows or duplicate items -> A stuck Ctrl key.
+  Run fix_stuck_keys.bat. No reboot needed. ScreenBot also releases
+  modifiers on startup, after every hotkey, on exit, and after 25s.
+- Auto-scan pauses / log says 429 -> Gemini free-tier rate limit.
+  ScreenBot pauses AI calls for 90s by default
+  ("quota_cooldown_seconds", minimum 15), then resumes.
+- No beep on startup -> Set "sound_feedback": true in config.json if you
+  want cue beeps. The separate status icon is not a timed popup.
+- Wrong language written -> Set "subject": "auto" in config.json, or pick
+  a language in tray -> Subject Preset. The follower never translates.
+- "running directly from ZIP" -> Extract the archive first.
 =======================================================================

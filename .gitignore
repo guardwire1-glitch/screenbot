@@ -43,6 +43,7 @@ watch_faces/
 *.env
 *.log
 !screen_bot/**
+!ide_extension/vscode/package.json
 screen_bot/session_data/
 screen_bot/session_frames/
 screen_bot/youtube_session_frames/

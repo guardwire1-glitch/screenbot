@@ -2,201 +2,302 @@
 Code Validator (Pipeline Stage 5):
 Deterministic Python validation gates.
 - normalize_for_diff(): used ONLY for diff comparison; never written to master or IDE.
-- LineConsensusTracker: enforces that a line must be observed in 2 consecutive stable frames
-  with identical normalized text and confidence >= 0.85 before admission to master.
-- Rejection of unreadable tokens («UNREADABLE»), sentinels, and non-code artifacts.
-- Deterministic syntax verification for all supported languages.
+- LineConsensusTracker: a line must be observed in consecutive frames before admission.
+- Rejection of unreadable tokens, ScreenBot sentinels, and browser chrome.
+- Deterministic bracket/string validation for all supported languages.
+
+Language-specific syntax checking lives in syntax_gate.py (tree-sitter). The
+scanner here is deliberately conservative: it only rejects delimiters that are
+provably unbalanced, so valid code is never blocked by a false positive.
 """
 
 import re
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
 try:
     from screen_bot.ai_vision_extractor import ExtractedLine, UNREADABLE_TOKEN
 except ModuleNotFoundError:
     from ai_vision_extractor import ExtractedLine, UNREADABLE_TOKEN
 
+# These are ScreenBot/pipeline artefacts, not source code. They must never be
+# injected into an editor. Ordinary keywords such as null/undefined/NaN are
+# valid code and are deliberately NOT listed here.
 SENTINEL_PATTERNS = [
-    r"\[ScreenBot.*?\]",
-    r"undefined",
-    r"null",
-    r"NaN",
-    r"```",
-    r"AI Vision",
-    r"Aptech",
-    r"temperature: 0",
+    r"_SB_[A-Z0-9_]+_",
+    r"Micro-edits applied",
+    r"\[ScreenBot",
+    r"\[REDACTED_API_KEY\]",
+    r"^```[\w+-]*\s*$",
+    r"^Here is (the|your) (solution|code)",
+    r"^Certainly[!,]",
 ]
+
+_BROWSER_CHROME = re.compile(
+    r"^(https?://|www\.|meet\.google\.com|teams\.(microsoft|live)\.com|"
+    r"youtube\.com/watch|classroom\.google\.com)",
+    re.IGNORECASE,
+)
+_CODEISH = re.compile(r"[;{}()\[\]=<>]|\b(class|void|return|import|using|def|public)\b")
 
 
 def normalize_for_diff(text: str) -> str:
-    """Normalizes string for comparison only. Strips all leading/trailing whitespace and collapses spaces."""
+    """Normalizes text for comparison only. Original formatting is never written."""
     return re.sub(r"\s+", " ", text.strip())
 
 
-def is_valid_code_line(line: ExtractedLine) -> bool:
-    """Rejects placeholder tokens, sentinel patterns, and obvious UI labels."""
-    if not line.text or not line.text.strip():
-        return True  # Empty lines are valid code separators
+def is_valid_code_line(line: ExtractedLine, min_confidence: Optional[float] = None) -> bool:
+    """Rejects placeholders, pipeline sentinels, and browser chrome.
+    Confidence is only enforced when the extractor actually provided one;
+    a missing confidence is not silently treated as certainty."""
+    text = getattr(line, "text", "") or ""
+    if not text.strip():
+        return True
 
-    if UNREADABLE_TOKEN in line.text:
+    if UNREADABLE_TOKEN in text:
         return False
 
+    stripped = text.strip()
     for pat in SENTINEL_PATTERNS:
-        if re.search(pat, line.text, re.IGNORECASE):
+        if re.search(pat, stripped, re.IGNORECASE):
             return False
 
-    # Check for obvious non-code UI artifacts (e.g. browser URL bars, Teams meeting banners)
-    lower = line.text.lower()
-    if any(k in lower for k in ["http://", "https://", "meet.google.com", "teams.microsoft.com", "youtube.com/watch"]):
+    # A bare URL is browser chrome; a URL inside a string literal is code.
+    if _BROWSER_CHROME.match(stripped) and not _CODEISH.search(stripped):
+        return False
+
+    # Partial/low-confidence lines are not rejected here: they are held as
+    # pending by LineConsensusTracker so a later clean frame can decide.
+    conf = getattr(line, "confidence", None)
+    if min_confidence is not None and conf is not None and conf < min_confidence:
         return False
 
     return True
 
 
+def is_weak_line(text: str) -> bool:
+    """Blank lines and lone punctuation carry no merge signal."""
+    return re.fullmatch(r"[{}()\[\];,\s]*", text or "") is not None
+
+
 class LineConsensusTracker:
-    """Tracks consecutive observations across frames. A line must be observed in 2 consecutive
-    stable frames with identical normalized text and confidence >= 0.85 before being accepted."""
+    """Tracks consecutive observations across frames. A line is admitted only
+    after it has been seen in `required_observations` consecutive frames with
+    identical normalized text. A line seen twice inside one frame counts once."""
 
     def __init__(self, required_observations: int = 2, min_confidence: float = 0.85):
-        self.required_observations = required_observations
+        self.required_observations = max(1, int(required_observations))
         self.min_confidence = min_confidence
-        # Map: normalized_line -> {"count": int, "last_raw": ExtractedLine, "last_seen_frame": int}
-        self._history: Dict[str, Dict] = {}
-        self._frame_counter: int = 0
+        self._history: Dict[Tuple[str, int], Dict] = {}
+        self._frame_counter = 0
+        self._last_pending_count = 0
 
-    def feed_frame_lines(self, lines: List[ExtractedLine]) -> Tuple[List[ExtractedLine], List[ExtractedLine]]:
-        """
-        Feeds a frame's lines.
-        Returns (accepted_lines, pending_lines).
-        """
+    @property
+    def has_pending(self) -> bool:
+        """True when the last frame left lines that a second look could accept.
+        The live path uses this to keep scanning instead of skipping a static
+        screen after a single observation."""
+        return self._last_pending_count > 0
+
+    def feed_frame_lines(
+        self, lines: List[ExtractedLine]
+    ) -> Tuple[List[ExtractedLine], List[ExtractedLine]]:
         self._frame_counter += 1
-        accepted = []
-        pending = []
+        accepted: List[ExtractedLine] = []
+        pending: List[ExtractedLine] = []
+        frame_occ: Dict[str, int] = {}
 
-        frame_occ_counts: Dict[str, int] = {}
-
-        for l in lines:
-            if not is_valid_code_line(l):
+        for line in lines:
+            if not is_valid_code_line(line):
                 continue
 
-            norm = normalize_for_diff(l.text)
-            occ_idx = frame_occ_counts.get(norm, 0)
-            frame_occ_counts[norm] = occ_idx + 1
-
-            # Non-blank lines must meet confidence threshold
-            if norm and l.confidence < self.min_confidence:
-                pending.append(l)
+            conf = getattr(line, "confidence", None)
+            visible = getattr(line, "visible", "full")
+            low_signal = (
+                (conf is not None and conf < self.min_confidence)
+                or visible not in (None, "full")
+            )
+            if low_signal:
+                # Never admit, never count: an uncertain or partially covered
+                # line must be seen cleanly in consecutive frames first.
+                pending.append(line)
                 continue
 
-            key = (norm, occ_idx)
+            norm = normalize_for_diff(line.text)
+            occ = frame_occ.get(norm, 0)
+            frame_occ[norm] = occ + 1
+            key = (norm, occ)
+
             entry = self._history.get(key)
-            if entry and (self._frame_counter - entry["last_seen_frame"] == 1):
-                # Consecutive frame observation
+            if entry and self._frame_counter - entry["last_seen_frame"] == 1:
                 entry["count"] += 1
                 entry["last_seen_frame"] = self._frame_counter
-                entry["last_raw"] = l
+                entry["last_raw"] = line
+                entry["blank"] = not norm
             else:
                 entry = {
                     "count": 1,
                     "last_seen_frame": self._frame_counter,
-                    "last_raw": l,
+                    "last_raw": line,
+                    "blank": not norm,
                 }
                 self._history[key] = entry
 
-            if entry["count"] >= self.required_observations:
-                accepted.append(l)
+            needs = 1 if (entry["blank"] and not is_weak_line(norm)) else self.required_observations
+            # Blank separator lines still need two sightings: a single blank row
+            # may just be an OCR gap, not a real blank line in the file.
+            if entry["blank"]:
+                needs = self.required_observations
+            if entry["count"] >= needs:
+                accepted.append(line)
             else:
-                pending.append(l)
+                pending.append(line)
 
-        # Decay/prune history entries not seen in this frame
-        dead_keys = [k for k, v in self._history.items() if self._frame_counter - v["last_seen_frame"] > 4]
-        for k in dead_keys:
-            del self._history[k]
+        dead = [k for k, v in self._history.items() if self._frame_counter - v["last_seen_frame"] > 4]
+        for key in dead:
+            del self._history[key]
 
+        self._last_pending_count = len(pending)
         return accepted, pending
+
+    def reset(self) -> None:
+        self._history.clear()
+        self._frame_counter = 0
+        self._last_pending_count = 0
+
+
+_STRING_STARTS = {'"', "'", "`"}
+
+
+def _language_comment_style(language: str) -> Tuple[str, bool]:
+    lang = (language or "").lower()
+    hash_comment = lang in {"python", "py", "ruby", "shell", "bash", "powershell", "r"}
+    dash_comment = lang in {"sql", "plsql", "tsql", "mysql", "postgresql"}
+    return ("hash" if hash_comment else "dash" if dash_comment else "slash"), hash_comment
 
 
 def validate_syntax(code: str, language: str = "general") -> Tuple[bool, str]:
+    """Deterministic delimiter/string validation.
+
+    Handles // and /* */ comments, C# verbatim and interpolated strings,
+    Python triple-quoted strings, shell/Python # comments and SQL -- comments.
+    Delimiters inside strings/comments are ignored. It cannot prove that code
+    compiles; it only rejects provably broken text before it reaches an editor.
     """
-    Validates code syntax deterministically:
-    - Balanced braces, brackets, and parentheses.
-    - String literal termination.
-    - Never injects broken syntax into IDE.
-    """
-    if not code.strip():
+    if not code or not code.strip():
         return True, ""
 
-    stack = []
-    pairs = {"{": "}", "(": ")", "[": "]"}
-    in_string = False
-    string_char = ""
-    in_single_line_comment = False
-    in_multi_line_comment = False
+    style, _ = _language_comment_style(language)
+    lang = (language or "").lower()
+    triple = lang in {"python", "py"}
+    verbatim_ok = lang in {"csharp", "cs"}
 
-    i = 0
-    n = len(code)
+    stack: List[Tuple[str, int]] = []
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    closers = {v: k for k, v in pairs.items()}
+    i, n = 0, len(code)
+    line = 1
+    quote: Optional[str] = None
+    triple_quote: Optional[str] = None
+    in_block_comment = False
+    at_line_start = True
 
     while i < n:
-        char = code[i]
-        next_char = code[i + 1] if i + 1 < n else ""
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
 
-        if in_single_line_comment:
-            if char == "\n":
-                in_single_line_comment = False
+        if ch == "\n":
+            line += 1
+            at_line_start = True
+            if quote in ("'", '"') and not verbatim_ok:
+                # C-like single/double quoted strings do not span raw newlines.
+                return False, f"Unterminated string literal starting on line {line - 1}"
             i += 1
             continue
 
-        if in_multi_line_comment:
-            if char == "*" and next_char == "/":
-                in_multi_line_comment = False
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
                 i += 2
                 continue
             i += 1
             continue
 
-        if in_string:
-            if char == "\\" and i + 1 < n:
+        if triple_quote:
+            if code.startswith(triple_quote, i):
+                i += 3
+                triple_quote = None
+                quote = None
+                continue
+            if ch == "\\":
                 i += 2
                 continue
-            if char == string_char:
-                in_string = False
             i += 1
             continue
 
-        # Check comment start
-        if char == "/" and next_char == "/":
-            in_single_line_comment = True
-            i += 2
-            continue
-        if char == "/" and next_char == "*":
-            in_multi_line_comment = True
-            i += 2
-            continue
-
-        # Check string start
-        if char in ('"', "'", "`"):
-            in_string = True
-            string_char = char
+        if quote:
+            if ch == "\\" and not (verbatim_ok and quote == '"'):
+                i += 2
+                continue
+            if verbatim_ok and quote == '"' and ch == '"' and nxt == '"':
+                i += 2  # "" escape inside a verbatim C# string
+                continue
+            if ch == quote:
+                quote = None
             i += 1
             continue
 
-        # Check delimiters
-        if char in pairs:
-            stack.append((char, i))
-        elif char in pairs.values():
+        # Comments (only when not inside a string)
+        if style == "slash" and ch == "/" and nxt == "/":
+            while i < n and code[i] != "\n":
+                i += 1
+            continue
+        if style == "slash" and ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if style == "hash" and ch == "#" and (at_line_start or code[i - 1:i].isspace()):
+            while i < n and code[i] != "\n":
+                i += 1
+            continue
+        if style == "dash" and ch == "-" and nxt == "-":
+            while i < n and code[i] != "\n":
+                i += 1
+            continue
+
+        if triple and (code.startswith('"""', i) or code.startswith("'''", i)):
+            triple_quote = code[i:i + 3]
+            quote = triple_quote[0]
+            i += 3
+            continue
+
+        if ch in _STRING_STARTS:
+            quote = ch
+            i += 1
+            continue
+
+        if ch in pairs:
+            stack.append((ch, line))
+        elif ch in closers:
             if not stack:
-                return False, f"Unmatched closing bracket '{char}' at index {i}"
-            opening, _ = stack.pop()
-            if pairs[opening] != char:
-                return False, f"Mismatched bracket '{opening}' closed with '{char}' at index {i}"
+                return False, f"Unmatched closing bracket '{ch}' on line {line}"
+            opening, opened_line = stack.pop()
+            if pairs[opening] != ch:
+                return False, (
+                    f"Mismatched bracket '{opening}' from line {opened_line} "
+                    f"closed with '{ch}' on line {line}"
+                )
 
+        at_line_start = False
         i += 1
 
-    if in_string:
+    if triple_quote:
+        return False, "Unterminated triple-quoted string literal"
+    if quote:
         return False, "Unterminated string literal"
-    if in_multi_line_comment:
+    if in_block_comment:
         return False, "Unterminated multi-line comment"
     if stack:
-        unclosed, idx = stack[-1]
-        return False, f"Unbalanced delimiter '{unclosed}' opened at index {idx}"
+        unclosed, opened_line = stack[-1]
+        return False, f"Unbalanced delimiter '{unclosed}' opened on line {opened_line}"
 
     return True, ""

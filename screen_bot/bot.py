@@ -18,6 +18,7 @@ import difflib
 import textwrap
 import logging
 import threading
+import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional
 import ctypes
@@ -45,9 +46,12 @@ from capture import (
     capture_screen_bytes,
     capture_screen_image,
     capture_screen_image_and_bytes,
+    capture_stable_frame,
+    encode_image_to_bytes,
     compute_frame_diff,
     CaptureBackoffManager,
     is_frame_black_or_blank,
+    get_foreground_window,
 )
 from ai_solver import ScreenSolver
 from shadow_master import ShadowMaster, MasterChangeEvent
@@ -61,7 +65,10 @@ from ai_vision_extractor import (
 )
 from code_validator import LineConsensusTracker, normalize_for_diff, is_valid_code_line, validate_syntax
 from merge_engine import MergeEngine, MergeDecision
-from doc_merge import DocMerger, Registry as DocRegistry, FrameLine as DocFrameLine, Meta as DocMeta, plan_injection, apply_plan
+from doc_merge import (
+    DocMerger, Registry as DocRegistry, FrameLine as DocFrameLine,
+    Meta as DocMeta, Cfg as DocCfg, plan_injection, apply_plan,
+)
 from ast_healer import HyperAwareCodeEngine
 from smart_context_engine import SmartCodeSynchronizer, heal_and_format
 from smart_sync_engine import ScreenBotSmartController, SyncResult, wait_for_physical_keys_released
@@ -69,6 +76,10 @@ from injector import SafeInjector, WindowFocusContext
 from failsafes import CircuitBreaker, ScanWatchdog, compute_build_hash
 from session_reconciler import SessionReconciler, FlaggedItem
 from harness import run_selftest
+from proposal_engine import MasterCodeTracker, validate_code_to_inject
+from editor_bridge import BridgeServer, PendingChange, BridgeError
+from editor_adapters import EditorRouter, EditorContext, ApplyResult, sha256_text
+from syntax_gate import gate as syntax_gate, check as syntax_check
 
 # Default embedded API key for instant out-of-the-box operation on any machine
 EMBEDDED_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -99,7 +110,7 @@ def load_config() -> Dict[str, Any]:
     """Loads configuration with proper 4-tier precedence:
     1. System environment variable (GEMINI_API_KEY / GOOGLE_API_KEY)
     2. .env file
-    3. %APPDATA%\\ScreenBot\config.json (per-user store)
+    3. %APPDATA%\\ScreenBot\\config.json (per-user store)
     4. Local config.json template
     """
     config: Dict[str, Any] = {
@@ -114,9 +125,14 @@ def load_config() -> Dict[str, Any]:
         "hotkey_auto_scan": "ctrl+alt\\\\",
         "lecture_auto_scan_interval": 5,
         "auto_scan_enabled": True,
-        "code_sync_mode": "delta",
         "hotkey_note_taker": "ctrl+4",
         "lecture_injection_mode": "paste",
+        "stability_interval": 0.35,
+        "stability_threshold": 2.0,
+        "lecture_pixel_diff_threshold": 2.0,
+        "max_frame_age_seconds": 12,
+        "quota_cooldown_seconds": 90,
+        "format_on_apply": False,
         "auto_type_on_solve": False,
         "typing_wpm": 38,
         "subject": "java",
@@ -241,6 +257,44 @@ def is_browser_or_meeting_window(hwnd) -> bool:
     return False
 
 
+# Virtual-key codes for every modifier Windows can leave logically down after
+# a suppressed global hotkey. CCtrl/Shift/Alt include generic, left and right.
+_MODIFIER_VKS = (0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C)
+_KEYEVENTF_KEYUP = 0x0002
+
+
+def release_all_modifiers(reason: str = "") -> None:
+    """Force key-up events for all modifiers. Must never raise.
+
+    A suppressed hotkey can leave Ctrl/Shift/Alt logically down when a handler
+    is interrupted. That turns every later click into Ctrl+click and every drag
+    into a copy. This is the last line of defence and is called in finally blocks.
+    """
+    try:
+        for vk in _MODIFIER_VKS:
+            try:
+                user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+            except Exception:
+                pass
+        if reason:
+            logger.debug(f"Released modifier keys ({reason}).")
+    except Exception:
+        pass
+
+
+def release_keys(*vks: int) -> None:
+    """Release specific shortcut keys (e.g. Ctrl/V) without touching other keys."""
+    try:
+        for vk in vks:
+            try:
+                user32.keybd_event(int(vk), 0, _KEYEVENTF_KEYUP, 0)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+
 def clean_code_line(line: str) -> str:
     """Strips OCR line numbers (e.g. '1 | ', '12: ', '3. ') and trailing whitespace."""
     l = re.sub(r"^\s*\d+[\s\|\.:]+", "", line)
@@ -248,32 +302,72 @@ def clean_code_line(line: str) -> str:
 
 
 def normalize_for_diff(line: str) -> str:
-    """Normalizes a code line for sequence matching by condensing whitespace."""
+    """Normalizes a line for comparison only.
+
+    Whitespace, smart quotes and quote style must not create a fake "new" line:
+    re-typing an unchanged statement is the exact duplicate-typing bug this
+    comparison exists to prevent. The raw text is never rewritten.
+    """
     cleaned = clean_code_line(line)
-    return re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.translate(str.maketrans({
+        "“": '"', "”": '"', "‘": "'", "’": "'", "\u00a0": " ", "\u200b": "",
+    }))
+    cleaned = cleaned.replace("'", '"')
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s*([(){}\[\];,.:])\s*", r"\1", cleaned)
+    return cleaned
 
 
-def compute_code_delta(master_code: str, new_code: str):
-    """Closed-loop scroll-immune delta computation.
-    Preserves all accumulated code across the entire file so lines that scroll
-    off the top/bottom are never forgotten or re-injected when scrolling back.
-    Returns: (delta_to_inject, updated_master_code)"""
+def compute_code_delta(master_code: str, new_code: str, with_parts: bool = False):
+    """Closed-loop, scroll-immune delta computation.
+
+    A frame is a *viewport*, never the whole file. Lines that scrolled off the
+    top or bottom must survive; new lines are spliced in at the position where
+    the frame's known lines anchor them. The only case that replaces the whole
+    master is a frame that starts at the top of the file.
+
+    Returns (delta, updated_master) or, with_parts=True,
+    (delta, updated_master, prefix, tail, suffix) where
+    prefix + tail + suffix == updated_master.splitlines().
+    """
+    def pack(delta: str, updated: str):
+        if not with_parts:
+            return delta, updated
+        lines = updated.splitlines()
+        delta_norm = [normalize_for_diff(x) for x in delta.splitlines() if x.strip()]
+        if not delta_norm:
+            return delta, updated, lines, [], []
+        line_norm = [normalize_for_diff(x) for x in lines if x.strip()]
+        positions, cursor = [], 0
+        for target_line in delta_norm:
+            found = -1
+            for idx in range(cursor, len(line_norm)):
+                if line_norm[idx] == target_line:
+                    found = idx
+                    break
+            if found < 0:
+                return delta, updated, [], lines, []
+            positions.append(found)
+            cursor = found + 1
+        content_rows = [i for i, x in enumerate(lines) if x.strip()]
+        first = content_rows[positions[0]]
+        last = content_rows[positions[-1]]
+        return delta, updated, lines[:first], lines[first:last + 1], lines[last + 1:]
+
     if not new_code or not new_code.strip():
-        return ("", master_code or "")
+        return pack("", master_code or "")
 
     new_raw_lines = [clean_code_line(l) for l in new_code.splitlines()]
     while new_raw_lines and not new_raw_lines[0].strip():
         new_raw_lines.pop(0)
     while new_raw_lines and not new_raw_lines[-1].strip():
         new_raw_lines.pop()
-
     if not new_raw_lines:
-        return ("", master_code or "")
+        return pack("", master_code or "")
 
     cleaned_new_code = "\n".join(new_raw_lines)
-
     if not master_code or not master_code.strip():
-        return (cleaned_new_code, cleaned_new_code)
+        return pack(cleaned_new_code, cleaned_new_code)
 
     master_raw_lines = [clean_code_line(l) for l in master_code.splitlines()]
     while master_raw_lines and not master_raw_lines[0].strip():
@@ -283,76 +377,76 @@ def compute_code_delta(master_code: str, new_code: str):
 
     m_norm = [normalize_for_diff(l) for l in master_raw_lines if l.strip()]
     n_norm = [normalize_for_diff(l) for l in new_raw_lines if l.strip()]
-
+    if not n_norm:
+        return pack("", master_code)
     if m_norm == n_norm:
-        return ("", master_code)
+        return pack("", master_code)
 
-    # Check if new_code is an exact tail subset of master (lecturer paused or scrolled slightly)
+    # Exact tail/subset: lecturer paused or the viewport moved slightly.
     if len(m_norm) >= len(n_norm) and m_norm[-len(n_norm):] == n_norm:
-        return ("", master_code)
+        return pack("", master_code)
 
-    matcher = difflib.SequenceMatcher(None, m_norm, n_norm)
+    matcher = difflib.SequenceMatcher(None, m_norm, n_norm, autojunk=False)
+    blocks = [b for b in matcher.get_matching_blocks() if b.size]
+    if not blocks:
+        return pack(cleaned_new_code, cleaned_new_code)
 
-    # If completely different file (lecturer switched tab, class, or project)
-    if matcher.ratio() < 0.25 and len(m_norm) >= 4 and len(n_norm) >= 4:
-        return (cleaned_new_code, cleaned_new_code)
-
-    # Check if new_code starts from the top of the file (e.g. line 0 or 1 matches root)
-    match_start = matcher.find_longest_match(0, min(3, len(m_norm)), 0, min(3, len(n_norm)))
-    starts_at_top = (match_start.a == 0 and match_start.b == 0 and match_start.size >= 1)
-
-    # If new_code starts at the top, it is an in-place update of the file.
-    # It must NEVER append to the bottom of master_code!
+    first = blocks[0]
+    starts_at_top = first.a == 0 and first.b == 0
     if starts_at_top:
         delta_lines = []
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
             if tag in ("insert", "replace"):
-                for k in range(j1, j2):
-                    delta_lines.append(new_raw_lines[k])
-        delta_text = "\n".join(delta_lines)
-        return (delta_text, cleaned_new_code)
+                delta_lines.extend(new_raw_lines[j1:j2])
+        return pack("\n".join(delta_lines), cleaned_new_code)
 
-    # Check for scroll-down anchor: does new_code overlap with lines near the end of master_code?
-    best_match = matcher.find_longest_match(0, len(m_norm), 0, len(n_norm))
-    if best_match.size >= max(2, int(len(n_norm) * 0.30)):
-        m_end = best_match.a + best_match.size
-        n_end = best_match.b + best_match.size
-        # Anchor is at the end of master, and new_lines has tail lines
-        if m_end >= len(m_norm) - 1:
-            tail_lines = new_raw_lines[n_end:]
-            if tail_lines:
-                new_master = master_code + "\n" + "\n".join(tail_lines)
-                return ("\n".join(tail_lines), new_master)
-            return ("", master_code)
+    # A low-similarity frame that does not start at the top is a different file
+    # (tab switch), not a scroll position.
+    if first.b > 0 and matcher.ratio() < 0.25 and len(m_norm) >= 4 and len(n_norm) >= 4:
+        return pack(cleaned_new_code, cleaned_new_code)
 
-    # Standard diff for inline additions or edits
-    delta_norm_indices = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag in ("insert", "replace"):
-            for k in range(j1, j2):
-                delta_norm_indices.append(k)
+    # Map normalized content indices back to raw rows so blank lines survive.
+    master_row = [i for i, l in enumerate(master_raw_lines) if l.strip()]
+    new_row = [i for i, l in enumerate(new_raw_lines) if l.strip()]
 
-    if not delta_norm_indices:
-        return ("", master_code)
-
+    inserts: Dict[int, list] = {}
+    replaces: Dict[int, tuple] = {}
     delta_lines = []
-    norm_idx = 0
-    for raw_l in new_raw_lines:
-        if raw_l.strip():
-            if norm_idx in delta_norm_indices:
-                delta_lines.append(raw_l)
-            norm_idx += 1
-        else:
-            if delta_lines:
-                delta_lines.append("")
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "insert":
+            pos = master_row[i1] if i1 < len(master_row) else len(master_raw_lines)
+            lines = [new_raw_lines[k] for k in new_row[j1:j2]]
+            inserts.setdefault(pos, []).extend(lines)
+            delta_lines.extend(lines)
+        elif tag == "replace":
+            if i2 <= i1:
+                continue
+            start = master_row[i1]
+            end = master_row[i2 - 1] + 1
+            lines = [new_raw_lines[k] for k in new_row[j1:j2]]
+            replaces[start] = (end, lines)
+            delta_lines.extend(lines)
+        # "delete" is deliberately ignored: an absent line may simply have
+        # scrolled out of view or be hidden by a tooltip.
 
-    while delta_lines and not delta_lines[-1].strip():
-        delta_lines.pop()
+    out, idx = [], 0
+    while idx < len(master_raw_lines):
+        if idx in inserts:
+            out.extend(inserts[idx])
+        if idx in replaces:
+            end, lines = replaces[idx]
+            out.extend(lines)
+            idx = end
+            continue
+        out.append(master_raw_lines[idx])
+        idx += 1
+    if len(master_raw_lines) in inserts:
+        out.extend(inserts[len(master_raw_lines)])
 
-    if not delta_lines:
-        return ("", master_code)
-
-    return ("\n".join(delta_lines), cleaned_new_code)
+    updated = "\n".join(out)
+    return pack("\n".join(delta_lines), updated)
 
 
 def is_likely_question(text: str, is_highlighted: bool = False) -> bool:
@@ -430,14 +524,20 @@ class ScreenBot:
         self.direct_file_sync = self.config.get("direct_file_sync", False)
         self.auto_scan_enabled = False
         self.auto_scan_thread = None
-        target_path = Path(self.target_file_path) if self.target_file_path else (SCRIPT_DIR / "shadow_master_code.txt")
-        self.shadow_master = ShadowMaster(file_path=target_path, log_dir=SCRIPT_DIR / "session_data", max_snapshots=50)
+        # ShadowMaster is an audit/snapshot store, never the delivery mechanism.
+        # Pointing it at the user's real file would bypass every gate below.
+        shadow_path = SCRIPT_DIR / "session_data" / "shadow_master_code.txt"
+        self.shadow_master = ShadowMaster(file_path=shadow_path, log_dir=SCRIPT_DIR / "session_data", max_snapshots=50)
         self.frame_archiver = FrameArchiver(session_dir=SCRIPT_DIR / "session_frames")
         self.stability_checker = FrameStabilityChecker(stability_threshold=0.02)
         self.occlusion_detector = OcclusionDetector()
         self.consensus_tracker = LineConsensusTracker(required_observations=2, min_confidence=0.85)
         self.merge_engine = MergeEngine()
-        self.doc_registry = DocRegistry()
+        # Consensus already requires two frames, so the document merger may apply
+        # an insertion on its first accepted frame. Destructive edits stay gated.
+        self.doc_registry = DocRegistry(cfg=DocCfg(
+            req_insert=1, req_modify=2, req_delete=2, req_rewrite=2,
+        ))
         self.ast_healer = HyperAwareCodeEngine(default_lang=self.current_subject)
         self.smart_synchronizer = SmartCodeSynchronizer(require_confirmations=2)
         self.smart_sync_controller = ScreenBotSmartController(
@@ -450,6 +550,30 @@ class ScreenBot:
         self.scan_watchdog = ScanWatchdog(timeout_seconds=30.0)
         self.session_reconciler = SessionReconciler(report_path=SCRIPT_DIR / "session_reconcile_report.md")
         self.build_hash = compute_build_hash()
+
+        # Live-path state. The tracker is the source of truth for undo.
+        self.master_tracker = MasterCodeTracker("")
+        self._ai_cooldown_until = 0.0
+        self._manual_sync_queued = False
+        self._manual_sync_waiting = False
+        self._stopping = False
+        self._consensus_file = ""
+        self._last_pending_count = 0
+
+        # IDE-agnostic editor bridge. The socket is started by main(), not by
+        # the constructor, so unit tests and one-off imports never bind a port.
+        self.bridge = BridgeServer(
+            pending_path=SCRIPT_DIR / "session_data" / "pending_changes.json",
+            logger=logger,
+        )
+        self.editor_router = EditorRouter(
+            self.bridge,
+            resolver=self._explicit_target_path,
+            logger=logger,
+            format_on_apply=bool(self.config.get("format_on_apply", False)),
+        )
+        self.bridge.pending_resolver = self.editor_router.resolve_pending
+        self._bridge_started = False
 
     def check_and_set_busy(self, action_name: str) -> bool:
         """Atomically checks if bot is busy, typing, or in cooldown debounce.
@@ -468,6 +592,410 @@ class ScreenBot:
             self.is_busy = True
             self.last_trigger_time = now
             return True
+
+    # ------------------------------------------------------------------
+    # Focus, clipboard and modifier guards
+    # ------------------------------------------------------------------
+    def _notify_guard(self, message: str) -> None:
+        """Best-effort tray notification for a safety-guard abort."""
+        if self.tray_icon:
+            try:
+                self.tray_icon.notify(message, "ScreenBot Guard")
+            except Exception:
+                pass
+
+    def _foreground_hwnd(self) -> Optional[int]:
+        try:
+            return int(user32.GetForegroundWindow() or 0) or None
+        except Exception:
+            return None
+
+    def _caret_target_safe(self, target_hwnd: Optional[int], action: str = "type") -> bool:
+        """Refuses synthetic keystrokes when focus moved or landed on chat/video."""
+        if not target_hwnd:
+            return True
+        try:
+            current = int(user32.GetForegroundWindow() or 0)
+        except Exception:
+            return True
+        if current != int(target_hwnd):
+            logger.warning(
+                f"Focus moved before {action} (expected {target_hwnd}, got {current}). "
+                "Aborting to prevent mis-typing."
+            )
+            self._notify_guard("Target window lost focus. Aborted to prevent mis-typing.")
+            self.play_sound("aborted")
+            return False
+        if is_browser_or_meeting_window(current):
+            logger.warning(
+                f"Refusing to {action} into a browser/meeting window (hwnd={current})."
+            )
+            self._notify_guard("Refused to type into a browser/meeting window.")
+            self.play_sound("aborted")
+            return False
+        return True
+
+    def _guarded_hotkey(self, handler):
+        """Wrap a hotkey so a swallowed modifier key-up cannot stick Ctrl/Shift."""
+        def _wrapped(*args, **kwargs):
+            try:
+                return handler(*args, **kwargs)
+            finally:
+                timer = threading.Timer(0.35, release_all_modifiers)
+                timer.daemon = True
+                timer.start()
+        return _wrapped
+
+    def _modifier_watchdog(self):
+        """Force-releases a modifier held implausibly long (>25s)."""
+        watched = {
+            "Ctrl": (0x11,),
+            "Shift": (0x10,),
+            "Alt": (0x12,),
+            "Win": (0x5B, 0x5C),
+        }
+        held_since: Dict[str, float] = {}
+        while not self._stopping:
+            time.sleep(1.0)
+            if self._stopping:
+                break
+            now = time.time()
+            try:
+                states = {
+                    name: any(bool(user32.GetAsyncKeyState(vk) & 0x8000) for vk in vks)
+                    for name, vks in watched.items()
+                }
+            except Exception:
+                continue
+            for name, is_down in states.items():
+                if is_down:
+                    held_since.setdefault(name, now)
+                else:
+                    held_since.pop(name, None)
+            stuck = [name for name, started in held_since.items() if now - started > 25.0]
+            if stuck:
+                logger.warning(
+                    "Modifier watchdog: %s held for >25s with no key-up. Force-releasing.",
+                    "/".join(stuck),
+                )
+                release_all_modifiers()
+                held_since.clear()
+
+    def release_stuck_keys(self, notify: bool = False):
+        """Manual escape hatch for a stuck modifier state."""
+        release_all_modifiers(reason="manual/tray request")
+        if notify:
+            self._notify_guard("Released Ctrl/Shift/Alt/Win. Normal clicks should work again.")
+
+    def show_running_badge(self):
+        """Show the 'ScreenBot is running' badge in a separate silent process."""
+        try:
+            auto_flag = "1" if self.auto_scan_enabled else "0"
+            parent_pid = str(os.getpid())
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--badge", parent_pid, auto_flag, self.current_subject]
+            else:
+                cmd = [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--badge",
+                    parent_pid,
+                    auto_flag,
+                    self.current_subject,
+                ]
+            creationflags = 0x08000000 if os.name == "nt" else 0
+            subprocess.Popen(cmd, creationflags=creationflags, close_fds=True)
+        except Exception as e:
+            logger.debug(f"Could not launch running badge: {e}")
+
+    # ------------------------------------------------------------------
+    # Master snapshots / undo / 2-read bookkeeping
+    # ------------------------------------------------------------------
+    def _commit_master_code(self, new_master: str) -> None:
+        """Advance the undo tracker only after an edit actually reached the editor."""
+        if not new_master or not new_master.strip():
+            return
+        previous = self.master_tracker.master_code
+        if previous and previous != new_master:
+            self.master_tracker.save_snapshot()
+        self.master_tracker.master_code = new_master
+        self.last_code_shadow = new_master
+
+    def _decay_candidate_reads(self, current_lines) -> None:
+        """Drop 2-read counters for candidate lines no longer on screen."""
+        from proposal_engine import normalize_code_line
+        keep = {
+            normalize_code_line(getattr(line, "text", line))
+            for line in current_lines
+        }
+        for key in list(self.master_tracker.read_counts):
+            if key not in keep:
+                del self.master_tracker.read_counts[key]
+
+    def trigger_undo(self, quiet: bool = False) -> bool:
+        """Ctrl+Alt+Z: restore the previous master and roll the target file back.
+
+        Refuses to touch the editor when its content no longer matches the code
+        ScreenBot last delivered. Undoing through a user's newer edits would be
+        data loss, not an undo.
+        """
+        if not self.master_tracker.snapshots:
+            if not quiet:
+                self.play_sound("aborted")
+                self._notify_guard("No earlier snapshots available to undo.")
+            return False
+
+        restored = self.master_tracker.snapshots[-1]
+        current_master = self.last_code_shadow
+
+        target = self._explicit_target_path() if self.direct_file_sync else None
+        ctx = None
+        if target is not None and target.exists():
+            ctx = self._editor_context_for(target)
+            if ctx is None:
+                logger.warning("Undo aborted: cannot read the bound editor/file.")
+                if not quiet:
+                    self.play_sound("aborted")
+                    self._notify_guard("Undo aborted: the bound file is not readable.")
+                return False
+            live_text = (ctx.text or "").replace("\r\n", "\n").strip()
+            expected_text = (current_master or "").replace("\r\n", "\n").strip()
+            if live_text != expected_text:
+                logger.warning(
+                    "Undo refused: the editor changed after ScreenBot's last sync."
+                )
+                if not quiet:
+                    self.play_sound("aborted")
+                    self._notify_guard(
+                        "Undo refused: the file changed after the last sync. "
+                        "Your newer edits were left untouched."
+                    )
+                return False
+
+        if target is not None and target.exists() and ctx is not None:
+            result = self.editor_router.apply(ctx, restored)
+            if not result.ok:
+                logger.warning(f"Undo apply failed ({result.error}); snapshot kept.")
+                if not quiet:
+                    self.play_sound("aborted")
+                    self._notify_guard(f"Undo failed: {result.error or 'editor rejected the edit'}")
+                return False
+
+        self.master_tracker.undo()
+        self.last_code_shadow = restored
+        self.last_injection_ended_with_newline = False
+        self.master_tracker.read_counts.clear()
+        self.consensus_tracker.reset()
+
+        if target is not None and target.exists():
+            logger.info(f"Undo rolled back {target} ({len(restored)} chars).")
+        else:
+            logger.info("Undo restored the internal master snapshot (no file was bound).")
+
+        self.play_sound("done")
+        if self.tray_icon:
+            try:
+                self.tray_icon.notify(
+                    "Restored the previous ScreenBot snapshot.",
+                    "ScreenBot Undo (Ctrl+Alt+Z)",
+                )
+            except Exception:
+                pass
+        return True
+
+    # ------------------------------------------------------------------
+    # Editor delivery
+    # ------------------------------------------------------------------
+    def _default_filename(self) -> str:
+        ext = {
+            "csharp": ".cs", "cs": ".cs", "java": ".java", "python": ".py",
+            "py": ".py", "sql": ".sql", "web": ".html", "javascript": ".js",
+            "typescript": ".ts", "cpp": ".cpp", "c": ".c",
+        }.get(str(self.current_subject).lower(), ".cs")
+        return f"lecture{ext}"
+
+    def _explicit_target_path(self) -> Optional[Path]:
+        """The user-bound file only. Auto-discovery is never allowed to pick a
+        write target: a same-named file in another folder must not be edited."""
+        if not self.target_file_path:
+            return None
+        try:
+            path = Path(self.target_file_path)
+            return path if path.is_file() else None
+        except Exception:
+            return None
+
+    def _bound_target_path(self) -> Optional[Path]:
+        return self._explicit_target_path() or self.get_or_detect_target_file()
+
+    def _editor_context_for(self, target: Optional[Path]) -> Optional[EditorContext]:
+        path = str(target) if target else None
+        try:
+            return self.editor_router.get_context(file_path=path)
+        except TypeError:
+            return self.editor_router.get_context()
+
+    def _start_bridge(self) -> None:
+        if self._bridge_started:
+            return
+        try:
+            self.bridge.start()
+            self._bridge_started = True
+        except Exception as e:
+            logger.warning(f"Editor bridge unavailable: {e}")
+
+    def _stop_bridge(self) -> None:
+        if not self._bridge_started:
+            return
+        try:
+            self.bridge.stop()
+        except Exception:
+            pass
+        self._bridge_started = False
+
+    @staticmethod
+    def _diagnostic_error_count(diagnostics, file_path: str = "") -> int:
+        count = 0
+        target_name = Path(file_path).name.lower() if file_path else ""
+        for item in diagnostics or []:
+            try:
+                if str(item.get("severity", "")).lower() != "error":
+                    continue
+                diag_file = str(item.get("file") or "")
+                if diag_file and target_name and Path(diag_file).name.lower() != target_name:
+                    continue
+                count += 1
+            except Exception:
+                continue
+        return count
+
+    def _queue_pending(self, context: EditorContext, proposed: str, reason: str,
+                       diagnostics=None) -> Optional[PendingChange]:
+        try:
+            change = self.editor_router.queue_pending(context, proposed, reason, diagnostics)
+            logger.warning(f"Change held for review: {reason} ({context.file_path}).")
+            self._notify_guard(f"Change held for review: {reason}")
+            return change
+        except Exception as e:
+            logger.error(f"Could not queue pending change: {e}")
+            return None
+
+    @staticmethod
+    def _missing_delivered_lines(previous_master: str, current_text: str) -> List[str]:
+        """Lines ScreenBot delivered that the buffer no longer contains.
+
+        Re-adding them would fight a deliberate user deletion, so the caller
+        holds the change for review instead.
+        """
+        current = {
+            normalize_for_diff(line)
+            for line in (current_text or "").replace("\r\n", "\n").splitlines()
+        }
+        current.discard("")
+        missing: List[str] = []
+        for line in (previous_master or "").replace("\r\n", "\n").splitlines():
+            key = normalize_for_diff(line)
+            if key and key not in current and key not in missing:
+                missing.append(key)
+        return missing
+
+    def _apply_master_direct(self, target: Path, master_text: str, delta_text: str = "") -> bool:
+        """Apply lecture knowledge to a real editor without clobbering user code."""
+        ctx = self._editor_context_for(target)
+        if ctx is None:
+            logger.error(f"Direct File Sync: cannot read editor/file context for {target}.")
+            self._notify_guard("Direct sync: target file is not readable. Nothing was typed.")
+            return False
+        if not ctx.can_apply or (ctx.dirty and ctx.source == "disk"):
+            self._queue_pending(
+                ctx, apply_plan(ctx.text, plan_injection(master_text, ctx.text)[0]),
+                "editor buffer has unsaved changes", ctx.diagnostics,
+            )
+            return False
+
+        missing = self._missing_delivered_lines(self.last_code_shadow, ctx.text)
+        if missing:
+            self._queue_pending(
+                ctx, apply_plan(ctx.text, plan_injection(master_text, ctx.text)[0]),
+                f"user removed {len(missing)} line(s) ScreenBot previously synced "
+                f"(first: {missing[0][:80]})",
+                ctx.diagnostics,
+            )
+            return False
+
+        steps, conflicts = plan_injection(master_text, ctx.text)
+        proposed = apply_plan(ctx.text, steps)
+        if proposed == ctx.text:
+            if conflicts:
+                self._queue_pending(
+                    ctx, master_text,
+                    f"user code differs from the lecture in {len(conflicts)} place(s)",
+                    ctx.diagnostics,
+                )
+                return False
+            logger.info("Target already contains every lecture line; no write needed.")
+            return True
+
+        # Validate the full document that will reach the editor, not only the
+        # delta: a closing brace alone is a valid live-coding insertion.
+        guard_text = master_text.strip() or delta_text
+        valid, reason = validate_code_to_inject(guard_text, self.current_subject)
+        if not valid:
+            logger.warning(f"Injection guard rejected direct-sync payload: {reason}")
+            self._queue_pending(ctx, proposed, f"injection guard: {reason}", ctx.diagnostics)
+            return False
+
+        syntax_ok, syntax_reason, _status = syntax_gate(
+            ctx.text, proposed,
+            language=ctx.language or self.current_subject,
+            filename=ctx.file_path,
+        )
+        if not syntax_ok:
+            logger.warning(f"Syntax gate held direct-sync change: {syntax_reason}")
+            self.session_reconciler.record_flagged_item(FlaggedItem(
+                frame_id=f"direct_{int(time.time() * 1000)}",
+                item_type="syntax_error",
+                reason=syntax_reason,
+                line_text=(master_text.splitlines()[0] if master_text.splitlines() else "")[:120],
+            ))
+            self._queue_pending(ctx, proposed, f"syntax gate: {syntax_reason}", ctx.diagnostics)
+            return False
+
+        result = self.editor_router.apply(ctx, proposed)
+        if not result.ok:
+            reason_text = result.error or ("file changed" if result.conflict else "editor rejected edit")
+            self._queue_pending(ctx, proposed, f"apply failed: {reason_text}", result.diagnostics)
+            return False
+
+        before_errors = self._diagnostic_error_count(ctx.diagnostics, ctx.file_path)
+        after_errors = self._diagnostic_error_count(result.diagnostics, ctx.file_path)
+        if after_errors > before_errors:
+            rollback = self.editor_router.restore(ctx, ctx.text, result.hash)
+            logger.error(
+                f"Diagnostics worsened ({before_errors} -> {after_errors}); "
+                f"rollback {'succeeded' if rollback.ok else 'FAILED'}."
+            )
+            self._queue_pending(
+                ctx, proposed,
+                f"diagnostics worsened from {before_errors} to {after_errors}",
+                result.diagnostics,
+            )
+            return False
+
+        if conflicts:
+            follow_steps, follow_conflicts = plan_injection(master_text, result.text)
+            if follow_conflicts:
+                self._queue_pending(
+                    ctx, apply_plan(result.text, follow_steps),
+                    f"user code differs in {len(follow_conflicts)} place(s)",
+                    result.diagnostics,
+                )
+
+        logger.info(
+            f"Direct File Sync applied through {result.source} -> {target} "
+            f"({len(proposed.splitlines())} lines, diagnostics {before_errors}->{after_errors})."
+        )
+        return True
 
     def play_sound(self, sound_type: str):
         """Plays subtle audio cues in a background thread."""
@@ -525,17 +1053,7 @@ class ScreenBot:
                 break
             time.sleep(0.04)
 
-        # Force Windows to treat modifier keys as released in the system state table
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            KEYEVENTF_KEYUP = 0x0002
-            user32.keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0)  # VK_CONTROL
-            user32.keybd_event(0x10, 0, KEYEVENTF_KEYUP, 0)  # VK_SHIFT
-            user32.keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0)  # VK_MENU (Alt)
-        except Exception:
-            pass
-
+        release_all_modifiers("")
         time.sleep(0.12)
 
     def interruptible_sleep(self, duration_s: float, user32=None) -> bool:
@@ -559,76 +1077,141 @@ class ScreenBot:
             time.sleep(0.012)
         return False
 
-    def instant_paste(self, text: str):
-        """Pastes text instantly using clipboard and hardware Ctrl+V with modifier guards.
-        Preserves 100% exact indentation in IDEs (VS Code, IntelliJ, Eclipse) with zero syntax errors."""
+    def instant_paste(self, text: str, target_hwnd: Optional[int] = None) -> bool:
+        """Paste via clipboard + Ctrl+V, then put the user's clipboard back.
+
+        Refuses to send synthetic keys when focus moved or landed on a browser or
+        meeting window. Modifier key-ups are sent in a finally block, so an
+        interrupted paste can never leave Ctrl or V logically down.
+        """
         if not text:
-            return
+            return False
+        if not self._caret_target_safe(target_hwnd, "paste"):
+            return False
+
+        VK_CONTROL, VK_V, KEYUP = 0x11, 0x56, 0x0002
+        original_clip: Optional[str] = None
+        pasted = False
         try:
             self.wait_for_modifiers_release()
+            try:
+                original_clip = pyperclip.paste()
+            except Exception:
+                original_clip = None
+
             pyperclip.copy(text)
             time.sleep(0.04)
-            import ctypes
-            user32 = ctypes.windll.user32
-            VK_CONTROL = 0x11
-            VK_V = 0x56
-            KEYEVENTF_KEYUP = 0x0002
+            try:
+                if pyperclip.paste() != text:
+                    raise RuntimeError("clipboard did not accept the payload")
+            except RuntimeError:
+                raise
+            except Exception:
+                # Some clipboard backends cannot read back; absence of proof is
+                # not proof of failure.
+                pass
+
+            if not self._caret_target_safe(target_hwnd, "paste"):
+                return False
 
             user32.keybd_event(VK_CONTROL, 0, 0, 0)
             time.sleep(0.02)
             user32.keybd_event(VK_V, 0, 0, 0)
             time.sleep(0.03)
-            user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_V, 0, KEYUP, 0)
             time.sleep(0.02)
-            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            logger.info(f"Instant paste injected ({len(text)} chars) directly into active window.")
+            user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
+            pasted = True
+            logger.info(f"Instant paste injected ({len(text)} chars) into hwnd={target_hwnd or 'foreground'}.")
+            return True
         except Exception as e:
-            logger.error(f"Error during instant paste, falling back to turbo typing: {e}")
-            self.human_type(text, is_turbo=True)
+            logger.error(f"Instant paste failed ({e}); falling back to guarded typing.")
+            self.human_type(text, is_turbo=True, target_hwnd=target_hwnd)
+            return False
+        finally:
+            try:
+                user32.keybd_event(VK_V, 0, KEYUP, 0)
+                user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
+            except Exception:
+                pass
+            if pasted:
+                # Give the target a moment to consume the clipboard before the
+                # user's own clipboard contents are restored.
+                time.sleep(0.12)
+            if original_clip is not None:
+                try:
+                    pyperclip.copy(original_clip)
+                except Exception:
+                    pass
 
-    def select_all_and_paste(self, text: str):
-        """Replaces entire editor buffer cleanly with updated code (Mirror mode)."""
+    def select_all_and_paste(self, text: str, target_hwnd: Optional[int] = None) -> bool:
+        """Ctrl+A then Ctrl+V. Only used for an explicit full-buffer mirror.
+
+        A failed clipboard write aborts instead of falling back to typing:
+        typing at the caret after a failed select-all would append partial code
+        to the wrong place.
+        """
         if not text:
-            return
+            return False
+        if not self._caret_target_safe(target_hwnd, "paste"):
+            return False
+
+        VK_CONTROL, VK_A, VK_V, KEYUP = 0x11, 0x41, 0x56, 0x0002
+        original_clip: Optional[str] = None
+        pasted = False
         try:
             self.wait_for_modifiers_release()
+            try:
+                original_clip = pyperclip.paste()
+            except Exception:
+                original_clip = None
             pyperclip.copy(text)
             time.sleep(0.04)
-            import ctypes
-            user32 = ctypes.windll.user32
-            VK_CONTROL = 0x11
-            VK_A = 0x41
-            VK_V = 0x56
-            KEYEVENTF_KEYUP = 0x0002
+            if not self._caret_target_safe(target_hwnd, "paste"):
+                return False
 
-            # Ctrl + A
             user32.keybd_event(VK_CONTROL, 0, 0, 0)
             time.sleep(0.02)
             user32.keybd_event(VK_A, 0, 0, 0)
             time.sleep(0.03)
-            user32.keybd_event(VK_A, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_A, 0, KEYUP, 0)
             time.sleep(0.02)
-            # Ctrl + V
             user32.keybd_event(VK_V, 0, 0, 0)
             time.sleep(0.03)
-            user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-            time.sleep(0.02)
-            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            logger.info(f"Mirror paste injected ({len(text)} chars) replacing editor buffer.")
+            user32.keybd_event(VK_V, 0, KEYUP, 0)
+            user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
+            pasted = True
+            logger.info(f"Mirror paste replaced the editor buffer ({len(text)} chars).")
+            return True
         except Exception as e:
-            logger.error(f"Error during select_all_and_paste: {e}")
-            self.instant_paste(text)
+            logger.error(f"select_all_and_paste aborted without typing: {e}")
+            return False
+        finally:
+            try:
+                user32.keybd_event(VK_A, 0, KEYUP, 0)
+                user32.keybd_event(VK_V, 0, KEYUP, 0)
+                user32.keybd_event(VK_CONTROL, 0, KEYUP, 0)
+            except Exception:
+                pass
+            if pasted:
+                time.sleep(0.12)
+            if original_clip is not None:
+                try:
+                    pyperclip.copy(original_clip)
+                except Exception:
+                    pass
 
-    def human_type(self, text: str, is_turbo: bool = False):
+    def human_type(self, text: str, is_turbo: bool = False, target_hwnd: Optional[int] = None):
         """Simulates realistic student typing (dynamic ~35-40 WPM) or turbo speed,
-        with micro-pauses and instant ESC cancel."""
+        with micro-pauses and instant ESC cancel. When a target HWND is supplied,
+        typing stops as soon as focus leaves that window."""
         if not text:
-            return
+            return False
 
         with self.lock:
             if self.is_typing:
                 logger.info("Already typing text, ignoring duplicate call.")
-                return
+                return False
             self.is_typing = True
             self.stop_typing_flag = False
 
@@ -644,23 +1227,28 @@ class ScreenBot:
         try:
             # 1. Wait for physical keys (Ctrl, Alt, Shift) to be released so they don't combine with typed letters!
             self.wait_for_modifiers_release()
+            if target_hwnd and not self._caret_target_safe(target_hwnd, "type"):
+                return False
 
             clean_text = text.replace("\r\n", "\n").replace("\r", "\n")
 
             if is_turbo:
                 self.play_sound("typing")
                 logger.info(f"Starting Turbo typing injection ({len(clean_text)} chars)... Press ESC to stop immediately.")
-                for char in clean_text:
+                for i, char in enumerate(clean_text):
                     if self.stop_typing_flag or (user32 and (user32.GetAsyncKeyState(0x1B) & 0x8000)):
                         self.stop_typing_flag = True
                         logger.info("Turbo typing cancelled immediately by ESC key.")
                         self.play_sound("aborted")
                         break
+                    if target_hwnd and i % 60 == 0 and not self._caret_target_safe(target_hwnd, "type"):
+                        self.stop_typing_flag = True
+                        break
                     self.pynput_ctrl.type(char)
                     time.sleep(0.0015)
                 if not self.stop_typing_flag:
                     logger.info("Turbo typing finished successfully.")
-                return
+                return not self.stop_typing_flag
 
             target_wpm = int(self.config.get("typing_wpm", 38))
             self.play_sound("typing")
@@ -675,6 +1263,9 @@ class ScreenBot:
                     self.stop_typing_flag = True
                     logger.info("Typing cancelled immediately by ESC key.")
                     self.play_sound("aborted")
+                    break
+                if target_hwnd and i % 40 == 0 and not self._caret_target_safe(target_hwnd, "type"):
+                    self.stop_typing_flag = True
                     break
 
                 self.pynput_ctrl.type(char)
@@ -720,9 +1311,11 @@ class ScreenBot:
 
             if not self.stop_typing_flag:
                 logger.info("Dynamic typing simulation finished successfully.")
+            return not self.stop_typing_flag
 
         except Exception as e:
             logger.error(f"Error during human typing: {e}")
+            return False
         finally:
             with self.lock:
                 self.is_typing = False
@@ -1006,218 +1599,363 @@ class ScreenBot:
 
 
     def undo_last_edit(self):
-        """Rolls back the master code to the previous snapshot."""
-        undone = self.smart_sync_controller.undo_last() or self.shadow_master.undo()
-        if undone:
+        """Ctrl+Alt+Z: restore the previous master and roll the target file back."""
+        if self.trigger_undo(quiet=True):
+            return True
+
+        # Legacy/audit fallback (also keeps direct ShadowMaster users working).
+        if self.shadow_master.undo():
+            self.last_code_shadow = self.shadow_master.get_current_code()
             self.play_sound("done")
-            logger.info("Undo: Restored previous code snapshot.")
-            if self.tray_icon:
-                try:
-                    self.tray_icon.notify("Restored previous code snapshot.", "ScreenBot Undo")
-                except Exception:
-                    pass
-        else:
+            logger.info("Undo: restored the previous shadow-master snapshot.")
+            self._notify_guard("Restored the previous code snapshot.")
+            return True
+
+        self.play_sound("aborted")
+        self._notify_guard("No earlier snapshots available to undo.")
+        return False
+
+    def trigger_ctrl_shift_f(self):
+        """Ctrl+Shift+F: bind the active editor file and start direct sync.
+
+        If a scan is already running the request is queued instead of ignored;
+        the watcher starts exactly one sync when the current cycle goes idle.
+        """
+        if not self.check_and_set_busy("Bind Editor File"):
+            self._manual_sync_queued = True
+            if not self._manual_sync_waiting:
+                self._manual_sync_waiting = True
+                threading.Thread(target=self._run_queued_manual_sync, daemon=True).start()
+            logger.info("Manual bind/sync queued until the current scan finishes.")
+            return
+        threading.Thread(target=self._bind_and_sync_worker, daemon=True).start()
+
+    def _run_queued_manual_sync(self):
+        try:
+            deadline = time.time() + 180.0
+            while not self._stopping and time.time() < deadline:
+                while self.is_busy and not self._stopping and time.time() < deadline:
+                    time.sleep(0.25)
+                if self._stopping or not self._manual_sync_queued:
+                    return
+                self._manual_sync_queued = False
+                self.trigger_ctrl_shift_f()
+                if not self._manual_sync_queued:
+                    return
+                # trigger_ctrl_shift_f re-queued this request (for example the
+                # hotkey debounce rejected it). Keep watching instead of
+                # dropping the user's bind request.
+                time.sleep(0.25)
+        finally:
+            self._manual_sync_waiting = False
+
+    _EDITOR_IDES = {
+        "vscode", "antigravity", "visualstudio", "ssms",
+        "jetbrains", "eclipse", "netbeans", "editor",
+    }
+
+    def _active_editor_file(self) -> Optional[Path]:
+        """Resolve the file the user is actually looking at.
+
+        VS Code family and Visual Studio answer with their real active buffer.
+        Disk-based IDEs expose only a filename in their title, so they cannot
+        be bound by guessing: they use an explicit target_file_path instead.
+        Binding a file while a browser or meeting window is focused is refused
+        by the caller.
+        """
+        _hwnd, _title, _exe, ide = self.editor_router.active_window()
+        if ide in {"vscode", "antigravity"}:
+            ctx = self.editor_router.extension.get_context(ide, file_path=None)
+            if ctx and ctx.file_path:
+                path = Path(ctx.file_path)
+                if path.is_file():
+                    return path
+        if ide == "visualstudio":
+            ctx = self.editor_router.visual_studio.get_context(file_path=None)
+            if ctx and ctx.file_path:
+                path = Path(ctx.file_path)
+                if path.is_file():
+                    return path
+        if ide in self._EDITOR_IDES:
+            # Guessing a path from a filename can bind a same-named file in
+            # another folder, which is the overwrite this design must never
+            # allow. Disk-based IDEs must use target_file_path.
+            logger.warning(
+                f"{ide} does not expose an exact active-file path; refusing to "
+                "bind by filename. Set target_file_path for this IDE."
+            )
+        return None
+
+    def _bind_and_sync_worker(self):
+        try:
+            target = self._active_editor_file()
+            if target is None:
+                logger.warning("Bind aborted: no exact editor file could be resolved.")
+                self._notify_guard(
+                    "Open the file in VS Code/Antigravity or Visual Studio, or set "
+                    "target_file_path for other IDEs, then press Ctrl+Shift+F. "
+                    "Nothing was bound or typed."
+                )
+                self.play_sound("aborted")
+                return
+            self.target_file_path = str(target)
+            self.direct_file_sync = True
+            self.config["direct_file_sync"] = True
+            logger.info(f"Direct File Sync bound to: {target}")
+            self.play_sound("done")
+            self.update_tray_tooltip(f"ScreenBot: Bound {target.name}")
+            self._notify_guard(f"Bound to {target.name}. Syncing lecture code now...")
+            self.process_code_shadow(force_full=False)
+        except Exception as e:
+            logger.error(f"Bind/sync failed: {e}", exc_info=True)
             self.play_sound("error")
+        finally:
+            with self.lock:
+                self.is_busy = False
 
     def bind_active_editor_file(self):
-        """Binds foreground editor file for zero-keystroke Direct File Sync AND immediately syncs code!"""
-        target = self.get_or_detect_target_file()
-        if target:
-            self.direct_file_sync = True
-            self.target_file_path = str(target)
-            self.shadow_master.file_path = target
-            self.play_sound("done")
-            logger.info(f"Direct File Sync bound to: {target}")
-            if self.tray_icon:
-                try:
-                    self.tray_icon.notify(
-                        f"Bound directly to {target.name}!\nSyncing code from lecture now...",
-                        "Direct File Sync Active"
-                    )
-                except Exception:
-                    pass
-            # Trigger immediate sync right now!
-            threading.Thread(target=self.process_code_shadow, kwargs={"force_full": False}, daemon=True).start()
-        else:
-            # If no file found on disk, still do immediate Caret Sync so user gets code instantly!
-            self.play_sound("trigger")
-            logger.info("No file on disk to bind, triggering immediate Caret Sync...")
-            threading.Thread(target=self.process_code_shadow, kwargs={"force_full": False}, daemon=True).start()
+        """Backwards-compatible menu/hotkey entry point."""
+        self.trigger_ctrl_shift_f()
+
+    def _log_shadow_event(self, frame_id: str, event_type: str, merged_code: str,
+                          pending=None) -> None:
+        """Append the audit event only after the edit actually reached the editor."""
+        try:
+            self.shadow_master.apply_change(MasterChangeEvent(
+                frame_id=frame_id,
+                event_type=event_type or "append",
+                gates_passed=["stability_gate", "consensus_gate"],
+                result_code=merged_code,
+                metadata={"pending_lines": len(pending or [])},
+            ))
+        except Exception as e:
+            logger.warning(f"Could not append shadow audit event: {e}")
 
     def process_code_shadow(self, is_auto: bool = False, force_full: bool = False):
-        """Captures lecturer's screen/video (YouTube, Teams Web/App, Zoom),
-        runs pixel gatekeeper, archives raw frame, extracts structured JSON code lines,
-        enforces 2-consecutive-frame consensus gate, deterministic syntax validation,
-        append-only middle-insertion merge into ShadowMaster, and persists atomically."""
+        """Capture a stable lecture frame, extract strict JSON, require a second
+        observation, merge append-only, then deliver through the editor bridge
+        (preferred) or a guarded caret paste.
+
+        The master advances only after delivery succeeds; a failed delivery
+        leaves the previous master intact so undo and the next scan agree with
+        the file that is actually on disk.
+        """
         hotkey = self.config.get("hotkey", "ctrl+0")
+        frame_id = f"frame_{int(time.time() * 1000)}"
         try:
             t0 = time.time()
-            frame_id = f"frame_{int(t0 * 1000)}"
+            if time.time() < self._ai_cooldown_until:
+                remaining = int(self._ai_cooldown_until - time.time())
+                logger.info(f"[{frame_id}] AI quota cooldown active ({remaining}s left); skipping.")
+                return
             if not is_auto:
                 self.play_sound("trigger")
                 self.update_tray_tooltip(f"ScreenBot: Capturing Lecture Code ({self.current_subject.upper()})...")
                 logger.info(f"[{frame_id}] Live Code Follower triggered (subject={self.current_subject}). Snapping lecture...")
 
-            # 1. Capture screen: both PIL Image (for local gates) and JPEG bytes (for AI)
-            pil_img, img_bytes = capture_screen_image_and_bytes(
+            pil_img, is_stable = capture_stable_frame(
                 mode="lecture",
-                max_dim=self.config.get("max_image_dimension", 1920),
-                quality=self.config.get("image_quality", 85),
+                interval=float(self.config.get("stability_interval", 0.35)),
+                threshold=float(self.config.get("stability_threshold", 2.0)),
+                max_dim=int(self.config.get("max_image_dimension", 1920)),
             )
             t_cap = time.time()
-
-            # 1b. Black/Blank / Locked Display Check
+            if pil_img is None:
+                logger.info(f"[{frame_id}] Capture returned no frame; skipping.")
+                return
+            if not is_stable:
+                logger.info(f"[{frame_id}] Frame is moving/animating; deferred without an AI call.")
+                return
             if is_frame_black_or_blank(pil_img):
-                logger.warning(f"[{frame_id}] Captured frame is black or blank (display locked/sleeping). Skipping cycle.")
+                logger.info(f"[{frame_id}] Frame is black/blank (display locked or not rendered); skipping.")
                 return
 
-            # 2. LOCAL PIXEL GATEKEEPER (Auto-Scan Only):
-            if is_auto and not force_full and self.last_lecture_frame is not None:
+            # The HWND is bound at snapshot time, not at typing time. That is the
+            # only way the focus guard can detect that the user alt-tabbed.
+            target_hwnd = self._foreground_hwnd()
+
+            if (is_auto and not force_full and self.last_lecture_frame is not None
+                    and not self.consensus_tracker.has_pending):
                 p_diff = compute_frame_diff(self.last_lecture_frame, pil_img)
-                if p_diff < 0.015:
-                    logger.debug(f"[{frame_id}] Lecture screen pixel diff={p_diff:.4f} < threshold. Screen is static, skipping AI call.")
+                threshold = float(self.config.get("lecture_pixel_diff_threshold", 2.0))
+                if p_diff < threshold:
+                    logger.debug(f"[{frame_id}] Static screen (diff={p_diff:.2f}); no AI call.")
                     return
 
-            self.last_lecture_frame = pil_img
-
-            # 3. Ring buffer archive
             try:
                 self.frame_archiver.archive_frame(pil_img, frame_id=frame_id)
             except Exception as e:
                 logger.warning(f"[{frame_id}] Frame archive warning: {e}")
 
-            # 4. Occlusion / Overlay detection
             occlusions = self.occlusion_detector.detect_occlusions(pil_img)
             if occlusions:
-                logger.info(f"[{frame_id}] Detected {len(occlusions)} occlusion/overlay region(s).")
+                logger.info(f"[{frame_id}] Local overlay detector: {len(occlusions)} region(s).")
 
-            if not is_auto:
-                logger.info(f"[{frame_id}] Capture & local gates finished in {(t_cap - t0)*1000:.1f}ms. Calling Gemini Vision...")
-
-            # 5. Extract structured code lines via AI
+            img_bytes = encode_image_to_bytes(
+                pil_img, quality=int(self.config.get("image_quality", 85))
+            )
             prompt = build_extraction_prompt(language_hint=self.current_subject)
             t_ai_start = time.time()
             raw_resp = self.solver.extract_lecture_code_structured(img_bytes, prompt=prompt)
-            t_ai_end = time.time()
-            logger.info(f"[{frame_id}] AI Vision responded in {(t_ai_end - t_ai_start)*1000:.1f}ms.")
+            logger.info(f"[{frame_id}] Vision extraction took {(time.time() - t_ai_start) * 1000:.1f}ms.")
 
-            if not raw_resp or raw_resp.startswith("[ScreenBot] Error"):
+            if getattr(self.solver, "last_error_kind", "") == "quota":
+                cooldown = max(15.0, float(self.config.get("quota_cooldown_seconds", 90)))
+                self._ai_cooldown_until = time.time() + cooldown
+                logger.warning(f"[{frame_id}] Gemini quota exhausted; pausing AI calls for {int(cooldown)}s.")
                 if not is_auto:
-                    logger.warning(f"[{frame_id}] AI extraction returned error: {raw_resp}")
                     self.play_sound("error")
+                return
+            if not raw_resp:
+                logger.info(f"[{frame_id}] No extraction result; master untouched.")
+                return
+
+            max_age = float(self.config.get("max_frame_age_seconds", 12))
+            frame_age = time.time() - t_cap
+            if max_age > 0 and frame_age > max_age:
+                logger.warning(
+                    f"[{frame_id}] Frame is {frame_age:.1f}s old (limit {max_age:.0f}s); "
+                    "discarding stale extraction instead of applying outdated code."
+                )
                 return
 
             parsed = parse_model_extraction_response(raw_resp)
+            if parsed.error:
+                logger.warning(f"[{frame_id}] Rejected malformed extraction: {parsed.error}")
+                return
+
+            self.last_lecture_frame = pil_img
             if not parsed.lines:
-                logger.info(f"[{frame_id}] No valid code lines returned by model.")
+                logger.info(f"[{frame_id}] No code visible (slide/webpage/dialog); nothing to merge.")
+                return
+            if parsed.has_occlusion:
+                logger.info(f"[{frame_id}] OCR reports an overlay covering code; holding this frame.")
                 return
 
-            # 6. Consensus Gate (2 consecutive stable frames, confidence >= 0.85)
+            file_key = (parsed.file_name or "").strip().lower()
+            if file_key and self._consensus_file and file_key != self._consensus_file:
+                logger.info(
+                    f"[{frame_id}] Editor tab switched ({self._consensus_file} -> {file_key}); "
+                    "resetting consensus."
+                )
+                self.consensus_tracker.reset()
+                self.last_injection_ended_with_newline = False
+            if file_key:
+                self._consensus_file = file_key
+
             accepted, pending = self.consensus_tracker.feed_frame_lines(parsed.lines)
-            logger.info(f"[{frame_id}] Consensus Gate: {len(accepted)} accepted, {len(pending)} pending 2nd observation.")
-
+            self._decay_candidate_reads(parsed.lines)
+            logger.info(
+                f"[{frame_id}] Consensus: {len(accepted)} accepted, "
+                f"{len(pending)} held for a cleaner frame."
+            )
             if not accepted:
-                logger.info(f"[{frame_id}] 0 lines passed 2-frame consensus; master code untouched.")
                 return
 
-            # 7. Merge Engine via DocMerger & Plan Injection (no duplicates, entity-level replacement)
-            target = self.get_or_detect_target_file(hint_file_name=parsed.file_name)
-            target_fname = target.name if target else (parsed.file_name or "lecture.cs")
-            doc = self.doc_registry.get(target_fname)
-
-            # Seed baseline from disk if doc is fresh or empty
-            disk_code = ""
-            if target and target.exists():
+            explicit_target: Optional[Path] = None
+            if self.target_file_path:
                 try:
-                    disk_code = target.read_text(encoding="utf-8")
-                    if disk_code.strip() and not doc.lines:
-                        doc.seed_baseline(disk_code)
+                    candidate = Path(self.target_file_path)
+                    if candidate.is_file():
+                        explicit_target = candidate
                 except Exception:
                     pass
 
-            doc_lines = [DocFrameLine(text=l.text, line_no=l.line_no, visible=l.visible, confidence=l.confidence) for l in accepted]
-            meta = DocMeta(file_name=target_fname, quality_ok=True, overlay=bool(occlusions))
-            merge_res = doc.merge(doc_lines, meta=meta)
-            logger.info(f"[{frame_id}] DocMerge Event: {merge_res.event}, notes={merge_res.notes}")
-
-            # Fallback to MergeEngine if doc.text is empty
-            merged_code = doc.text if doc.text.strip() else self.merge_engine.merge(disk_code, accepted).merged_code
-
-            if not merged_code.strip() or merge_res.event in ("noop", "blocked", "low_quality", "held"):
-                logger.info(f"[{frame_id}] No changes to apply (event={merge_res.event}). Master is already consistent.")
-                return
-
-            # 8. AST Syntax Validation & Deterministic Healing
-            healed = self.ast_healer.heal_entire_file(merged_code, filename=target_fname)
-            if healed.was_healed:
-                logger.info(f"[{frame_id}] AST Healer resolved issues: {healed.fixed_issues}")
-                merged_code = healed.code
-
-            is_valid_syntax, syntax_err = validate_syntax(merged_code, language=self.current_subject)
-            if not is_valid_syntax and healed.needs_llm_repair:
-                logger.warning(f"[{frame_id}] Syntax Gate flagged errors ({syntax_err}); attempting surgical AST LLM repair...")
-                repair_prompt = self.ast_healer.build_llm_repair_prompt(
-                    current_file_code=disk_code or merged_code,
-                    new_screen_code=merged_code,
-                    issues=healed.remaining_issues,
-                )
-                repaired_resp = self.solver.solve_text(repair_prompt, mode="concise", subject=self.current_subject)
-                if repaired_resp and not repaired_resp.startswith("[ScreenBot] Error"):
-                    is_rep_valid, _ = validate_syntax(repaired_resp, language=self.current_subject)
-                    if is_rep_valid:
-                        merged_code = repaired_resp
-                        is_valid_syntax = True
-                        logger.info(f"[{frame_id}] Surgical LLM repair succeeded!")
-
-            if not is_valid_syntax:
-                logger.warning(f"[{frame_id}] Syntax Gate FAILED ({syntax_err}). Holding changes as pending.")
-                self.session_reconciler.record_flagged_item(FlaggedItem(
-                    line_no=0,
-                    raw_text="SYNTAX_CHECK_FAIL",
-                    reason=f"Syntax error: {syntax_err}",
-                    confidence=0.0,
-                    frame_id=frame_id,
-                ))
-                return
-
-            # 9. Atomic Update to Shadow Master & JSONL Event Log
-            change_event = MasterChangeEvent(
-                frame_id=frame_id,
-                event_type=merge_res.event,
-                lines_added=[i + 1 for i, _ in enumerate(merge_res.inserted)],
-                lines_modified=[],
-                gates_passed=["stability_gate", "consensus_gate", "syntax_gate"],
-                result_code=merged_code,
-            )
-            self.shadow_master.apply_change(change_event)
-            self.last_code_shadow = merged_code
-            logger.info(f"[{frame_id}] Shadow Master updated ({len(merged_code.splitlines())} lines). Total cycle: {(time.time() - t0):.2f}s.")
-
-            # 10. Persistence / Direct File Sync (Never repeats existing user code)
-            if self.direct_file_sync and target and target.exists():
-                steps, conflicts = plan_injection(merged_code, disk_code)
-                if steps:
-                    final_disk_code = apply_plan(disk_code, steps)
-                    self.write_code_to_file(target, final_disk_code)
-                    logger.info(f"[{frame_id}] Direct File Sync applied {len(steps)} plan steps to: {target}")
-                elif not disk_code.strip():
-                    self.write_code_to_file(target, merged_code)
-                    logger.info(f"[{frame_id}] Direct File Sync initialized empty file: {target}")
-                else:
-                    logger.info(f"[{frame_id}] File on disk already contains all merged code.")
+            if self.direct_file_sync:
+                if explicit_target is None:
+                    logger.warning(
+                        f"[{frame_id}] Direct File Sync is on but no file is bound; "
+                        "no keystrokes were sent. Press Ctrl+Shift+F to bind."
+                    )
+                    self._notify_guard("Direct sync needs a bound file. Nothing was typed.")
+                    return
+                ctx = self._editor_context_for(explicit_target)
+                target_fname = explicit_target.name
             else:
-                # Caret Mode: inject ONLY missing lines planned against target
-                steps, conflicts = plan_injection(merged_code, disk_code)
-                delta_lines = []
-                for s in steps:
-                    if isinstance(s, tuple) and len(s) == 4 and s[0] == "replace":
-                        delta_lines.extend(s[3])
-                    else:
-                        delta_lines.extend(s[1])
-                delta_text = "\n".join(delta_lines)
-                if delta_text:
-                    self.inject_lecture_code(delta_text, is_delta=True, full_master=merged_code)
-                    logger.info(f"[{frame_id}] Caret Delta Injected ({len(delta_lines)} new lines).")
+                target = explicit_target
+                ctx = self._editor_context_for(target)
+                if ctx is not None and ctx.file_path:
+                    target_fname = Path(ctx.file_path).name
+                elif target is not None:
+                    target_fname = target.name
+                else:
+                    target_fname = parsed.file_name or self._default_filename()
+
+            baseline_known = ctx is not None
+            baseline = ctx.text if ctx is not None else ""
+            if not baseline_known and explicit_target is not None and explicit_target.exists():
+                try:
+                    baseline = explicit_target.read_text(encoding="utf-8", errors="replace")
+                    baseline_known = True
+                except Exception as e:
+                    logger.debug(f"[{frame_id}] Could not read target baseline: {e}")
+            if not baseline_known:
+                baseline = self.master_tracker.master_code
+
+            doc = self.doc_registry.get(target_fname)
+            if not doc.lines and baseline.strip():
+                doc.seed_baseline(baseline)
+
+            doc_lines = [
+                DocFrameLine(
+                    text=l.text, line_no=l.line_no, visible=l.visible, confidence=l.confidence
+                )
+                for l in accepted
+            ]
+            meta = DocMeta(
+                file_name=target_fname,
+                quality_ok=True,
+                overlay=parsed.has_occlusion,
+                flags=tuple(parsed.flags),
+                top=None,
+                bottom="eof_visible" in parsed.flags,
+                allow_destructive=False,
+            )
+            merge_res = doc.merge(doc_lines, meta=meta)
+            logger.info(f"[{frame_id}] DocMerge event={merge_res.event} notes={merge_res.notes}")
+
+            if merge_res.event in ("blocked", "low_quality"):
+                logger.warning(f"[{frame_id}] Merge refused ({merge_res.event}); file untouched.")
+                return
+
+            merged_code = doc.text
+            if not merged_code.strip():
+                return
+
+            delivery_baseline = ctx.text if ctx is not None else baseline
+            steps, conflicts = plan_injection(merged_code, delivery_baseline)
+            delta_lines: list[str] = []
+            for step in steps:
+                if isinstance(step, tuple) and len(step) == 4 and step[0] == "replace":
+                    delta_lines.extend(step[3])
+                else:
+                    delta_lines.extend(step[1])
+
+            if not delta_lines and not conflicts:
+                self._commit_master_code(merged_code)
+                logger.info(f"[{frame_id}] Target already contains the merged code; master synchronized.")
+                return
+            if not delta_lines and conflicts and ctx is not None:
+                self._queue_pending(
+                    ctx, merged_code,
+                    f"user code differs from the lecture in {len(conflicts)} place(s)",
+                    ctx.diagnostics,
+                )
+                return
+
+            delta_text = "\n".join(delta_lines).strip("\n")
+            delivered = self.inject_lecture_code(
+                delta_text, is_delta=True, full_master=merged_code, target_hwnd=target_hwnd
+            )
+            if delivered:
+                self._log_shadow_event(frame_id, merge_res.event, merged_code, pending)
+                logger.info(
+                    f"[{frame_id}] Delivered {len(delta_lines)} new line(s) through "
+                    f"{'direct file sync' if self.direct_file_sync else 'guarded caret'}. "
+                    f"Cycle {time.time() - t0:.2f}s."
+                )
+            else:
+                logger.warning(f"[{frame_id}] Delivery aborted or held; master not advanced.")
 
         except Exception as e:
             logger.error(f"Error in process_code_shadow: {e}", exc_info=True)
@@ -1228,39 +1966,57 @@ class ScreenBot:
             with self.lock:
                 self.is_busy = False
 
-    def inject_lecture_code(self, code_text: str, is_delta: bool = True, full_master: str = ""):
-        """Injects lecture code:
-        If Direct File Sync is active: writes the master code directly to the source file on disk.
-        Otherwise: uses Smart Caret Injection (dedented, drop to next line, trailing newline).
+    def inject_lecture_code(self, code_text: str, is_delta: bool = True,
+                            full_master: str = "", target_hwnd: Optional[int] = None) -> bool:
+        """Deliver lecture code to the real editor.
+
+        Direct File Sync writes only through a hash-checked, syntax-gated editor
+        adapter and never types into the foreground window. Caret mode pastes
+        only when the snapshot window still has focus and is not a browser or
+        meeting window. The master advances only after delivery succeeds.
         """
         if not code_text and not full_master:
-            return
+            return False
 
-        # 1. DIRECT FILE SYNC MODE (Zero-Keystroke Toyota Hilux Mode)
+        # 1. DIRECT FILE SYNC: hash-checked adapter, zero keystrokes.
         if self.direct_file_sync:
-            target = self.get_or_detect_target_file()
-            if target and target.exists():
-                code_to_write = full_master if full_master else code_text
-                if self.write_code_to_file(target, code_to_write):
-                    self.play_sound("done")
-                    self.update_tray_tooltip(f"ScreenBot: Synced to {target.name}")
-                    logger.info(f"Direct File Sync succeeded -> {target} ({len(code_to_write)} chars).")
-                    if self.tray_icon:
-                        try:
-                            self.tray_icon.notify(
-                                f"Synced code into {target.name} ({len(code_text)} new chars)!",
-                                "ScreenBot Sync Complete"
-                            )
-                        except Exception:
-                            pass
-                    return
-                else:
-                    logger.warning(f"Direct file write to {target} failed, falling back to Caret Mode.")
+            target = self._explicit_target_path()
+            if target is None:
+                logger.error("Direct File Sync has no bound target file; nothing was written or typed.")
+                self._notify_guard(
+                    "Focus your editor and press Ctrl+Shift+F to bind the file first. "
+                    "Nothing was typed."
+                )
+                self.play_sound("aborted")
+                return False
 
-        # 2. SMART CARET INJECTION MODE
+            master_text = full_master or code_text
+            applied = self._apply_master_direct(target, master_text, code_text)
+            if not applied:
+                logger.warning(f"Direct sync to {target} was held; master not advanced.")
+                return False
+
+            self._commit_master_code(master_text)
+            self.play_sound("done")
+            self.update_tray_tooltip(f"ScreenBot: Synced to {target.name}")
+            self._notify_guard(f"Synced lecture code into {target.name}.")
+            logger.info(f"Direct File Sync succeeded -> {target} ({len(master_text)} chars).")
+            self.last_injection_ended_with_newline = True
+            return True
+
+        # 2. GUARDED CARET INJECTION.
         dedented = textwrap.dedent(code_text).strip()
         if not dedented:
-            return
+            if full_master:
+                self._commit_master_code(full_master)
+            return True
+
+        valid, reason = validate_code_to_inject(dedented, self.current_subject)
+        if not valid:
+            logger.warning(f"Caret injection guard rejected payload: {reason}")
+            self._notify_guard(f"Code held back by the injection guard: {reason}")
+            self.play_sound("aborted")
+            return False
 
         payload = dedented + "\n"
 
@@ -1275,23 +2031,21 @@ class ScreenBot:
 
         injection_mode = self.config.get("lecture_injection_mode", "paste")
         self.update_tray_tooltip("ScreenBot: Injecting New Code...")
-        self.play_sound("done")
 
         if injection_mode == "turbo_type":
-            self.human_type(payload, is_turbo=True)
+            delivered = self.human_type(payload, is_turbo=True, target_hwnd=target_hwnd)
         else:
-            self.instant_paste(payload)
+            delivered = self.instant_paste(payload, target_hwnd=target_hwnd)
 
-        if self.tray_icon:
-            try:
-                self.tray_icon.notify(
-                    f"Pasted new code at cursor ({len(code_text)} chars)!",
-                    "ScreenBot Paste Complete"
-                )
-            except Exception:
-                pass
+        if not delivered:
+            logger.warning("Caret injection aborted (focus/guard/clipboard); master not advanced.")
+            return False
 
+        self._commit_master_code(full_master or dedented)
+        self.play_sound("done")
         self.last_injection_ended_with_newline = True
+        self._notify_guard(f"Pasted new lecture code at the caret ({len(dedented)} chars).")
+        return True
 
     def toggle_direct_file_sync(self):
         """Toggles zero-keystroke Direct File Sync mode."""
@@ -1448,24 +2202,38 @@ class ScreenBot:
             logger.error(f"Could not open log: {e}")
 
     def stop(self, icon=None, item=None):
-        """Terminates ScreenBot cleanly."""
-        logger.info("ScreenBot exiting via tray menu...")
+        """Terminate cleanly. Idempotent: tray click and exit hotkey can race.
+
+        Modifiers are released both before and after unhooking. A forced kill
+        (taskkill /F) still cannot run this code; stop_bot.bat therefore also
+        sends key-ups via PowerShell before killing the process.
+        """
+        if self._stopping:
+            return
+        self._stopping = True
+        self.auto_scan_enabled = False
+
+        release_all_modifiers(reason="shutdown")
         try:
             if hasattr(self, "session_reconciler") and hasattr(self, "shadow_master"):
                 self.session_reconciler.generate_report(self.shadow_master.get_current_code())
                 logger.info("Session reconcile report written to session_reconcile_report.md.")
         except Exception as e:
             logger.debug(f"Could not generate reconcile report: {e}")
+
         try:
             keyboard.unhook_all()
         except Exception:
             pass
+        self._stop_bridge()
 
         if self.tray_icon:
             try:
                 self.tray_icon.stop()
             except Exception:
                 pass
+
+        release_all_modifiers()
         sys.exit(0)
 
     def start(self):
@@ -1495,55 +2263,67 @@ class ScreenBot:
         logger.info(f"  Auto-Scan Enabled on Startup              : {self.config.get('auto_scan_enabled', True)}")
         logger.info("=" * 60)
 
-        # Register global solve hotkeys
-        keyboard.add_hotkey(hotkey, self.trigger_concise)
+        self._stopping = False
+
+        # Every hotkey that can fire while a modifier is still pressed goes
+        # through the guard, which force-releases Ctrl/Shift/Alt shortly after
+        # the handler returns. Only Ctrl+Shift+F is suppressed: it would
+        # otherwise open the editor's "find in files" dialog.
+        keyboard.add_hotkey(hotkey, self._guarded_hotkey(self.trigger_concise))
         if hotkey_explain:
-            keyboard.add_hotkey(hotkey_explain, self.trigger_explain)
+            keyboard.add_hotkey(hotkey_explain, self._guarded_hotkey(self.trigger_explain))
         if hotkey_paraphrase:
-            keyboard.add_hotkey(hotkey_paraphrase, self.trigger_paraphrase)
+            keyboard.add_hotkey(hotkey_paraphrase, self._guarded_hotkey(self.trigger_paraphrase))
 
         # Register Live Code Follower: Incremental Delta (Ctrl+\ and Ctrl+3)
-        keyboard.add_hotkey(hotkey_code_shadow, self.trigger_code_shadow)
+        keyboard.add_hotkey(hotkey_code_shadow, self._guarded_hotkey(self.trigger_code_shadow))
         if hotkey_code_shadow.lower() != "ctrl+\\":
             try:
-                keyboard.add_hotkey("ctrl+\\", self.trigger_code_shadow)
+                keyboard.add_hotkey("ctrl+\\", self._guarded_hotkey(self.trigger_code_shadow))
             except Exception:
                 pass
         if hotkey_code_shadow.lower() != "ctrl+3":
             try:
-                keyboard.add_hotkey("ctrl+3", self.trigger_code_shadow)
+                keyboard.add_hotkey("ctrl+3", self._guarded_hotkey(self.trigger_code_shadow))
             except Exception:
                 pass
 
         # Force Full Code Re-Sync (Ctrl+Shift+\)
-        keyboard.add_hotkey(hotkey_force_sync, self.trigger_force_code_shadow)
+        keyboard.add_hotkey(hotkey_force_sync, self._guarded_hotkey(self.trigger_force_code_shadow))
 
         # Bind Active File to Direct File Sync (Ctrl+Shift+F)
-        keyboard.add_hotkey("ctrl+shift+f", self.bind_active_editor_file)
+        keyboard.add_hotkey(
+            "ctrl+shift+f",
+            self._guarded_hotkey(self.trigger_ctrl_shift_f),
+            suppress=True,
+        )
 
         # Toggle Auto-Scan Loop (Ctrl+Alt+\)
-        keyboard.add_hotkey(hotkey_auto_scan, self.toggle_auto_scan)
+        keyboard.add_hotkey(hotkey_auto_scan, self._guarded_hotkey(self.toggle_auto_scan))
 
         # Lecture Note-Taker (Ctrl+4)
-        keyboard.add_hotkey(hotkey_note_taker, self.trigger_note_taker)
+        keyboard.add_hotkey(hotkey_note_taker, self._guarded_hotkey(self.trigger_note_taker))
 
         # Register Highlight-and-Solve / Auto-Typer hotkeys (Primary: Ctrl+2)
-        keyboard.add_hotkey("ctrl+2", self.handle_type_or_solve)
+        keyboard.add_hotkey("ctrl+2", self._guarded_hotkey(self.handle_type_or_solve))
         if hotkey_type and hotkey_type.lower() != "ctrl+2":
             try:
-                keyboard.add_hotkey(hotkey_type.lower(), self.handle_type_or_solve)
+                keyboard.add_hotkey(hotkey_type.lower(), self._guarded_hotkey(self.handle_type_or_solve))
             except Exception:
                 pass
-        keyboard.add_hotkey("ctrl+shift+v", self.handle_type_or_solve)
-        keyboard.add_hotkey("ctrl+alt+v", self.handle_type_or_solve)
-        keyboard.add_hotkey("ctrl+7", self.handle_type_or_solve)
+        keyboard.add_hotkey("ctrl+shift+v", self._guarded_hotkey(self.handle_type_or_solve))
+        keyboard.add_hotkey("ctrl+alt+v", self._guarded_hotkey(self.handle_type_or_solve))
+        keyboard.add_hotkey("ctrl+7", self._guarded_hotkey(self.handle_type_or_solve))
 
-        # Kill switch hotkey Ctrl+Alt+Esc (not bare ESC) and undo hotkey Ctrl+Alt+Z
+        # Kill switch (Ctrl+Alt+Esc) and undo (Ctrl+Alt+Z). These are never
+        # suppressed: suppressing an OS-level kill shortcut can strand modifiers.
         keyboard.add_hotkey("ctrl+alt+esc", lambda: self.stop())
-        keyboard.add_hotkey("ctrl+alt+z", self.undo_last_edit)
+        keyboard.add_hotkey("ctrl+alt+z", self._guarded_hotkey(self.undo_last_edit))
         keyboard.add_hotkey("esc", self.cancel_typing)
         keyboard.add_hotkey("ctrl+shift+x", self.cancel_typing)
         keyboard.add_hotkey("ctrl+shift+q", lambda: self.stop())
+
+        threading.Thread(target=self._modifier_watchdog, daemon=True).start()
 
         # Build System Tray Menu
         icon_img = get_or_create_icon_image()
@@ -1586,17 +2366,6 @@ class ScreenBot:
                 checked=lambda item: self.config.get("lecture_injection_mode", "paste") == mode_val,
             )
 
-        def set_sync_mode(mode_val):
-            self.config["code_sync_mode"] = mode_val
-            logger.info(f"Code sync mode set to: {mode_val}")
-
-        def sync_mode_item(title, mode_val):
-            return pystray.MenuItem(
-                title,
-                lambda icon, item: set_sync_mode(mode_val),
-                checked=lambda item: self.config.get("code_sync_mode", "delta") == mode_val,
-            )
-
         menu_items = [
             pystray.MenuItem(f"ScreenBot: Ready ({hotkey.upper()})", None, enabled=False),
             pystray.MenuItem("Solve Screen (Ctrl+0)", lambda icon, item: self.trigger_concise()),
@@ -1619,13 +2388,6 @@ class ScreenBot:
             ),
             pystray.MenuItem("Lecture Note-Taker / Slides (Ctrl+4)", lambda icon, item: self.trigger_note_taker()),
             pystray.MenuItem("⏹ Emergency Stop Typing (ESC)", lambda icon, item: self.cancel_typing()),
-            pystray.MenuItem(
-                "Code Follower Mode",
-                pystray.Menu(
-                    sync_mode_item("Incremental Delta (Only New Lines at Cursor) [Default]", "delta"),
-                    sync_mode_item("Full Buffer Mirror (Select All & Replace)", "mirror"),
-                ),
-            ),
             pystray.MenuItem(
                 "Typing Speed (WPM)",
                 pystray.Menu(
@@ -1735,7 +2497,68 @@ def ensure_single_instance():
         logger.debug(f"Could not check single instance mutex: {e}")
 
 
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            code = ctypes.wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == 259  # STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return True
+
+
+def run_running_badge(parent_pid: int, auto_flag: str, subject: str):
+    """Separate silent process that only shows the running badge.
+
+    It never registers hotkeys, never touches the clipboard, and exits when
+    the parent process disappears, so it cannot become an orphan.
+    """
+    try:
+        icon = pystray.Icon(
+            "ScreenBotBadge",
+            get_or_create_icon_image(),
+            f"ScreenBot running | auto-scan {'ON' if auto_flag == '1' else 'OFF'} | {subject.upper()}",
+            pystray.Menu(pystray.MenuItem("ScreenBot is active", None, enabled=False)),
+        )
+
+        def watch_parent():
+            while True:
+                time.sleep(3.0)
+                if not _pid_alive(parent_pid):
+                    try:
+                        icon.stop()
+                    except Exception:
+                        pass
+                    return
+
+        threading.Thread(target=watch_parent, daemon=True).start()
+        icon.run()
+    except Exception as e:
+        logger.debug(f"Running badge exited: {e}")
+
+
 def main():
+    if "--badge" in sys.argv:
+        idx = sys.argv.index("--badge")
+        try:
+            parent_pid = int(sys.argv[idx + 1])
+        except (IndexError, ValueError):
+            parent_pid = 0
+        auto_flag = sys.argv[idx + 2] if len(sys.argv) > idx + 2 else "0"
+        subject = sys.argv[idx + 3] if len(sys.argv) > idx + 3 else "auto"
+        run_running_badge(parent_pid, auto_flag, subject)
+        return
+
     if "--selftest" in sys.argv:
         report = run_selftest(check_api=True, api_key=load_config().get("gemini_api_key", ""))
         print("========================================")
@@ -1748,6 +2571,8 @@ def main():
 
     ensure_single_instance()
     bot = ScreenBot()
+    bot._start_bridge()
+    bot.show_running_badge()
     bot.start()
 
 

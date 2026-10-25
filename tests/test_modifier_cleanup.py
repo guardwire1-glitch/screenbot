@@ -264,6 +264,7 @@ def test_start_registers_ctrl_shift_f_as_the_only_suppressed_hotkey(
     screen_bot, monkeypatch
 ):
     recorded = []
+    screen_bot.config["auto_scan_enabled"] = False
     monkeypatch.setattr(
         bot.keyboard,
         "add_hotkey",

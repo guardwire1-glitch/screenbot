@@ -141,14 +141,23 @@ def get_split_screen_opposite_rect() -> Optional[Tuple[int, int, int, int]]:
     return None
 
 
+def get_foreground_window() -> Optional[int]:
+    try:
+        return int(user32.GetForegroundWindow() or 0) or None
+    except Exception:
+        return None
+
+
 def capture_screen_image(
     mode: str = "active_window",
     target_hwnd: Optional[int] = None,
     target_region: Optional[Tuple[int, int, int, int]] = None,
     max_dim: int = 1920,
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    crop_rect: Optional[Tuple[int, int, int, int]] = None,
 ) -> Optional[Image.Image]:
     """Captures the screen using mss first with ImageGrab fallback."""
-    bbox = target_region
+    bbox = bbox or target_region
     if not bbox:
         if target_hwnd:
             bbox = get_active_window_rect(target_hwnd)
@@ -191,6 +200,16 @@ def capture_screen_image(
     if img is None or is_frame_black_or_blank(img):
         return None
 
+    if crop_rect:
+        try:
+            l, t, r, b = (int(v) for v in crop_rect)
+            l, t = max(0, l), max(0, t)
+            r, b = min(img.width, r), min(img.height, b)
+            if r > l and b > t:
+                img = img.crop((l, t, r, b))
+        except Exception:
+            pass
+
     # Downscale if exceeding max_dim
     if max_dim and (img.width > max_dim or img.height > max_dim):
         ratio = min(max_dim / img.width, max_dim / img.height)
@@ -200,23 +219,97 @@ def capture_screen_image(
     return img
 
 
-def capture_screen_image_and_bytes(mode: str = "active_window", max_dim: int = 1920, quality: int = 85):
-    """Captures the screen and returns both PIL Image and compressed JPEG bytes in one call."""
-    img = capture_screen_image(mode=mode, max_dim=max_dim)
-    if img is None:
-        return None, b""
+def encode_image_to_bytes(
+    img: Image.Image, export_format: str = "PNG", quality: int = 85
+) -> bytes:
+    """Encodes a PIL image in memory. PNG is lossless (best for OCR); JPEG is smaller."""
+    fmt = (export_format or "PNG").upper()
+    if fmt == "JPG":
+        fmt = "JPEG"
+    if fmt not in {"PNG", "JPEG", "WEBP"}:
+        fmt = "PNG"
     export_img = img
-    if export_img.mode in ("RGBA", "P"):
+    if fmt in {"JPEG", "WEBP"} and export_img.mode in ("RGBA", "P", "LA"):
         export_img = export_img.convert("RGB")
     buf = io.BytesIO()
-    export_img.save(buf, format="JPEG", quality=quality, optimize=True)
-    return img, buf.getvalue()
+    if fmt == "PNG":
+        export_img.save(buf, format="PNG", optimize=False)
+    else:
+        export_img.save(buf, format=fmt, quality=max(10, min(100, int(quality))), optimize=True)
+    return buf.getvalue()
 
 
-def capture_screen_bytes(mode: str = "active_window", max_dim: int = 1920, quality: int = 85) -> bytes:
-    """Captures the screen and compresses to JPEG bytes directly in memory."""
-    _, b = capture_screen_image_and_bytes(mode=mode, max_dim=max_dim, quality=quality)
-    return b
+def capture_screen_image_and_bytes(
+    mode: str = "active_window",
+    max_dim: int = 1920,
+    quality: int = 85,
+    export_format: str = "JPEG",
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    target_hwnd: Optional[int] = None,
+    crop_rect: Optional[Tuple[int, int, int, int]] = None,
+):
+    """Captures the screen and returns both PIL Image and encoded bytes."""
+    img = capture_screen_image(
+        mode=mode, max_dim=max_dim, bbox=bbox, target_hwnd=target_hwnd, crop_rect=crop_rect
+    )
+    if img is None:
+        return None, b""
+    return img, encode_image_to_bytes(img, export_format=export_format, quality=quality)
+
+
+def capture_screen_bytes(
+    mode: str = "active_window",
+    max_dim: int = 1920,
+    quality: int = 85,
+    export_format: str = "JPEG",
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    target_hwnd: Optional[int] = None,
+    crop_rect: Optional[Tuple[int, int, int, int]] = None,
+) -> bytes:
+    """Captures the screen and encodes it without touching disk."""
+    _, data = capture_screen_image_and_bytes(
+        mode=mode,
+        max_dim=max_dim,
+        quality=quality,
+        export_format=export_format,
+        bbox=bbox,
+        target_hwnd=target_hwnd,
+        crop_rect=crop_rect,
+    )
+    return data
+
+
+def capture_stable_frame(
+    mode: str = "lecture",
+    bbox: Optional[Tuple[int, int, int, int]] = None,
+    target_hwnd: Optional[int] = None,
+    crop_rect: Optional[Tuple[int, int, int, int]] = None,
+    interval: float = 0.35,
+    threshold: float = 2.0,
+    max_dim: int = 1920,
+) -> Tuple[Optional[Image.Image], bool]:
+    """Captures two frames and reports whether the scene was static.
+
+    Mean absolute pixel difference is 0..255, so `threshold` is expressed in
+    the same unit (2.0 ≈ 0.8% of full range). Returns the second frame because
+    it is the one closest to the moment the caller is about to read.
+    """
+    first = capture_screen_image(
+        mode=mode, target_region=bbox, target_hwnd=target_hwnd,
+        crop_rect=crop_rect, max_dim=max_dim,
+    )
+    if first is None:
+        return None, False
+    time.sleep(max(0.0, interval))
+    second = capture_screen_image(
+        mode=mode, target_region=bbox, target_hwnd=target_hwnd,
+        crop_rect=crop_rect, max_dim=max_dim,
+    )
+    if second is None:
+        return first, False
+    diff = compute_frame_diff(first, second)
+    return second, diff <= threshold
+
 
 
 def compute_frame_diff(img1: Optional[Image.Image], img2: Optional[Image.Image]) -> float:

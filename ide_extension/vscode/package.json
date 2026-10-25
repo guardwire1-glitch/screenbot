@@ -1,0 +1,41 @@
+{
+  "name": "screenbot-editor-bridge",
+  "displayName": "ScreenBot Editor Bridge",
+  "description": "Gives ScreenBot the real editor buffer, diagnostics, and safe hash-checked edits. Works in VS Code, Antigravity, Cursor, and other VS Code-based editors.",
+  "version": "1.0.0",
+  "publisher": "screenbot",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "screenbot.reviewPending",
+        "title": "ScreenBot: Review Pending Code Changes"
+      },
+      {
+        "command": "screenbot.showStatus",
+        "title": "ScreenBot: Show Bridge Status"
+      }
+    ],
+    "configuration": {
+      "title": "ScreenBot",
+      "properties": {
+        "screenbot.bridgePort": {
+          "type": "number",
+          "default": 0,
+          "description": "Override the ScreenBot bridge port. 0 reads the port from %APPDATA%/ScreenBot/bridge.json."
+        },
+        "screenbot.formatOnApply": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run the document formatter after ScreenBot applies code. Off by default because it reformats the whole file."
+        }
+      }
+    }
+  }
+}

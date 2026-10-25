@@ -46,8 +46,9 @@ class Meta:
     quality_ok: bool = True
     overlay: bool = False          # toast/tooltip/popup on screen
     flags: tuple = ()              # folded / wrapped / hscroll / low_quality
-    top: Optional[bool] = None     # top of file visible (None -> infer from line_no==1)
+    top: Optional[bool] = None     # top of file visible (None -> unknown, never inferred from viewport numbers)
     bottom: bool = False           # blank editor area below last line is visible
+    allow_destructive: bool = True # live OCR should pass False; only verified edits may delete
 
 
 @dataclass
@@ -189,7 +190,9 @@ class DocMerger:
         t = l.text or ""
         if l.visible != "full" or UNREADABLE in t or any(b in t for b in BAD_TEXT):
             return False
-        return not (norm(t) and l.confidence < self.cfg.min_conf)
+        if not norm(t):
+            return True
+        return l.confidence is None or l.confidence >= self.cfg.min_conf
 
     def merge(self, frame, meta: Optional[Meta] = None) -> Result:
         meta, cfg = meta or Meta(), self.cfg
@@ -197,7 +200,9 @@ class DocMerger:
         if not meta.quality_ok:
             r.event = "low_quality"
             return r
-        if meta.file_name and self.file_name and meta.file_name != self.file_name:
+        meta_name = (meta.file_name or "").replace("\\", "/").split("/")[-1].strip().lower()
+        doc_name = (self.file_name or "").replace("\\", "/").split("/")[-1].strip().lower()
+        if meta_name and doc_name and meta_name != doc_name:
             r.event, r.notes = "blocked", ["file_mismatch"]
             return r
         self._n += 1
@@ -206,8 +211,16 @@ class DocMerger:
             getattr(x, "visible", "full"), float(getattr(x, "confidence", 1.0))) for x in frame]
         ok = [self._ok(x) for x in fl]
         tx = [x.text if o else "" for x, o in zip(fl, ok)]
-        destr = not meta.overlay and not (set(meta.flags) & RISKY_FLAGS) and self._n >= self._freeze
-        top = meta.top if meta.top is not None else bool(fl and fl[0].line_no == 1)
+        destr = (
+            meta.allow_destructive
+            and not meta.overlay
+            and not (set(meta.flags) & RISKY_FLAGS)
+            and self._n >= self._freeze
+        )
+        # A viewport line number of 1 is not proof that the file's first line is
+        # on screen (OCR gutters restart at 1). Unknown means unknown: additions
+        # are still allowed, deletions are not.
+        top = meta.top if meta.top is not None else False
         ch: list = []   # (start, end, new, sig, required, destructive, is_entity)
 
         # 1) complete entities on screen replace/insert by name -------------------

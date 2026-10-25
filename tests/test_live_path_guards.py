@@ -13,16 +13,27 @@ into the running code):
     into Teams/YouTube chat when the lecture player happened to have focus.
 """
 
+import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "screen_bot"))
 
 import bot
 import capture
+
+
+def _patterned_frame() -> Image.Image:
+    """A non-blank frame: solid colors are (correctly) rejected before the AI call."""
+    img = Image.new("RGB", (64, 48), (240, 240, 240))
+    draw = ImageDraw.Draw(img)
+    for x in range(0, 64, 4):
+        draw.line((x, 0, x, 47), fill=(10, 10, 10))
+    return img
 
 
 class _DummyClipboard:
@@ -89,7 +100,7 @@ def test_process_code_shadow_defers_unstable_frame(screen_bot, monkeypatch):
     calls = []
     monkeypatch.setattr(
         screen_bot.solver,
-        "extract_lecture_code",
+        "extract_lecture_code_structured",
         lambda *a, **k: calls.append(1) or "",
     )
 
@@ -103,24 +114,38 @@ def test_process_code_shadow_defers_unstable_frame(screen_bot, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_process_code_shadow_binds_snapshot_hwnd(screen_bot, monkeypatch):
-    img = Image.new("RGB", (32, 32), (1, 2, 3))
+    img = _patterned_frame()
     monkeypatch.setattr(bot, "capture_stable_frame", lambda **kwargs: (img, True))
     monkeypatch.setattr(bot, "encode_image_to_bytes", lambda *a, **k: b"png-bytes")
     monkeypatch.setattr(bot, "user32", _FakeUser32(777))
+    monkeypatch.setattr(screen_bot, "_editor_context_for", lambda target: None)
+    monkeypatch.setattr(screen_bot.frame_archiver, "archive_frame", lambda *a, **k: None)
+    monkeypatch.setattr(screen_bot.occlusion_detector, "detect_occlusions", lambda *a, **k: [])
+
+    envelope = json.dumps({
+        "tab": "Demo.cs",
+        "language": "csharp",
+        "overlay": False,
+        "eof_visible": False,
+        "code": "class Demo\n{\n    int x = 1;\n}",
+    })
     monkeypatch.setattr(
         screen_bot.solver,
-        "extract_lecture_code",
-        lambda *a, **k: "int x = 1;",
+        "extract_lecture_code_structured",
+        lambda *a, **k: envelope,
     )
 
     screen_bot.direct_file_sync = False
     screen_bot.target_file_path = None
     screen_bot.last_lecture_frame = None
+    screen_bot.consensus_tracker.reset()
+    screen_bot.consensus_tracker.required_observations = 1
 
     captured = {}
 
     def fake_inject(code_text, is_delta=True, full_master="", target_hwnd=None):
         captured.update(code=code_text, hwnd=target_hwnd, master=full_master)
+        return True
 
     monkeypatch.setattr(screen_bot, "inject_lecture_code", fake_inject)
 
@@ -128,6 +153,41 @@ def test_process_code_shadow_binds_snapshot_hwnd(screen_bot, monkeypatch):
 
     assert captured["hwnd"] == 777
     assert "int x = 1;" in captured["code"]
+    assert "class Demo" in captured["master"]
+
+
+def test_stale_vision_result_is_discarded(screen_bot, monkeypatch):
+    """A late Gemini answer describes a frame the lecture has moved past."""
+    img = _patterned_frame()
+    monkeypatch.setattr(bot, "capture_stable_frame", lambda **kwargs: (img, True))
+    monkeypatch.setattr(bot, "encode_image_to_bytes", lambda *a, **k: b"png-bytes")
+    monkeypatch.setattr(bot, "user32", _FakeUser32(777))
+    monkeypatch.setattr(screen_bot, "_editor_context_for", lambda target: None)
+    monkeypatch.setattr(screen_bot.frame_archiver, "archive_frame", lambda *a, **k: None)
+    monkeypatch.setattr(screen_bot.occlusion_detector, "detect_occlusions", lambda *a, **k: [])
+
+    envelope = json.dumps({
+        "tab": "Demo.cs", "language": "csharp", "overlay": False,
+        "eof_visible": False, "code": "int x = 1;",
+    })
+
+    def slow_extraction(*a, **k):
+        time.sleep(0.05)
+        return envelope
+
+    monkeypatch.setattr(screen_bot.solver, "extract_lecture_code_structured", slow_extraction)
+    screen_bot.config["max_frame_age_seconds"] = 0.01
+    screen_bot.consensus_tracker.required_observations = 1
+
+    delivered = []
+    monkeypatch.setattr(
+        screen_bot, "inject_lecture_code", lambda *a, **k: delivered.append(True) or True
+    )
+
+    screen_bot.process_code_shadow(is_auto=True)
+
+    assert delivered == []
+    assert screen_bot.last_lecture_frame is None
 
 
 def test_caret_guard_blocks_focus_change(screen_bot, monkeypatch):
@@ -170,6 +230,11 @@ def test_direct_file_sync_writes_disk_snapshots_and_skips_caret(screen_bot, monk
     monkeypatch.setattr(screen_bot, "instant_paste", lambda text, target_hwnd=None: typed.append(text))
     monkeypatch.setattr(screen_bot, "human_type", lambda text, is_turbo=False, target_hwnd=None: typed.append(text))
     monkeypatch.setattr(screen_bot, "get_or_detect_target_file", lambda *a, **k: target)
+    monkeypatch.setattr(
+        screen_bot,
+        "_editor_context_for",
+        lambda t: screen_bot.editor_router.disk.get_context(str(t)),
+    )
 
     screen_bot.inject_lecture_code(
         "    int x = 1;", is_delta=True, full_master=new_master, target_hwnd=111
@@ -179,6 +244,190 @@ def test_direct_file_sync_writes_disk_snapshots_and_skips_caret(screen_bot, monk
     assert typed == []  # zero-keystroke mode: never type into the foreground window
     assert screen_bot.master_tracker.snapshots == [old_master]
     assert screen_bot.master_tracker.master_code == new_master
+
+
+def test_direct_sync_never_auto_discovers_a_write_target(
+    screen_bot, monkeypatch, tmp_path
+):
+    auto = tmp_path / "Demo.cs"
+    auto.write_text("int x = 1;\n", encoding="utf-8")
+    screen_bot.direct_file_sync = True
+    screen_bot.target_file_path = None
+    monkeypatch.setattr(screen_bot, "get_or_detect_target_file", lambda *a, **k: auto)
+    monkeypatch.setattr(
+        screen_bot,
+        "_apply_master_direct",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("wrote an unbound file")),
+    )
+    messages = []
+    monkeypatch.setattr(screen_bot, "_notify_guard", lambda msg: messages.append(msg))
+
+    assert screen_bot.inject_lecture_code(
+        "int x = 2;", is_delta=True, full_master="int x = 2;\n"
+    ) is False
+    assert auto.read_text(encoding="utf-8") == "int x = 1;\n"
+    assert messages and "bind" in messages[0].lower()
+
+
+def test_direct_sync_holds_when_user_removed_a_delivered_line(
+    screen_bot, monkeypatch, tmp_path
+):
+    target = tmp_path / "Demo.cs"
+    delivered = "class Demo\n{\n    int x = 1;\n}\n"
+    target.write_text("class Demo\n{\n}\n", encoding="utf-8")  # user deleted int x
+
+    screen_bot.direct_file_sync = True
+    screen_bot.target_file_path = str(target)
+    screen_bot.last_code_shadow = delivered
+    monkeypatch.setattr(
+        screen_bot,
+        "_editor_context_for",
+        lambda t: screen_bot.editor_router.disk.get_context(str(t)),
+    )
+    reasons = []
+    monkeypatch.setattr(
+        screen_bot,
+        "_queue_pending",
+        lambda ctx, proposed, reason, diagnostics=None: reasons.append(reason),
+    )
+
+    new_master = "class Demo\n{\n    int y = 2;\n}\n"
+    assert screen_bot.inject_lecture_code("", is_delta=True, full_master=new_master) is False
+
+    assert target.read_text(encoding="utf-8") == "class Demo\n{\n}\n"
+    assert len(reasons) == 1 and "removed" in reasons[0]
+    assert screen_bot.last_code_shadow == delivered
+
+
+def test_direct_sync_queues_instead_of_writing_a_dirty_disk_buffer(
+    screen_bot, monkeypatch, tmp_path
+):
+    from editor_adapters import EditorContext
+
+    target = tmp_path / "Demo.cs"
+    target.write_text("class Demo\n{\n}\n", encoding="utf-8")
+    ctx = EditorContext(
+        file_path=str(target),
+        text=target.read_text(encoding="utf-8"),
+        language="csharp",
+        dirty=True,
+        source="disk",
+        hash="irrelevant",
+        can_apply=False,
+    )
+    monkeypatch.setattr(screen_bot, "_editor_context_for", lambda _t: ctx)
+    monkeypatch.setattr(
+        screen_bot.editor_router,
+        "apply",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("wrote a dirty buffer")),
+    )
+    reasons = []
+    monkeypatch.setattr(
+        screen_bot,
+        "_queue_pending",
+        lambda ctx, proposed, reason, diagnostics=None: reasons.append(reason),
+    )
+
+    applied = screen_bot._apply_master_direct(
+        target, "class Demo\n{\n    int x = 1;\n}\n"
+    )
+
+    assert applied is False
+    assert reasons and "unsaved" in reasons[0]
+    assert target.read_text(encoding="utf-8") == "class Demo\n{\n}\n"
+
+
+def test_direct_sync_holds_a_syntax_regression(screen_bot, monkeypatch, tmp_path):
+    from editor_adapters import EditorContext
+    from editor_adapters import sha256_text
+
+    target = tmp_path / "Demo.cs"
+    base = "class Demo\n{\n}\n"
+    target.write_text(base, encoding="utf-8")
+    ctx = EditorContext(
+        file_path=str(target),
+        text=base,
+        language="csharp",
+        dirty=False,
+        source="disk",
+        hash=sha256_text(base),
+        can_apply=True,
+    )
+    monkeypatch.setattr(screen_bot, "_editor_context_for", lambda _t: ctx)
+    monkeypatch.setattr(
+        screen_bot.editor_router,
+        "apply",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("applied invalid syntax")),
+    )
+    reasons = []
+    monkeypatch.setattr(
+        screen_bot,
+        "_queue_pending",
+        lambda ctx, proposed, reason, diagnostics=None: reasons.append(reason),
+    )
+
+    applied = screen_bot._apply_master_direct(
+        target, "class Demo\n{\n    void Broken( {\n}\n"
+    )
+
+    assert applied is False
+    assert reasons and "syntax" in reasons[0].lower()
+    assert target.read_text(encoding="utf-8") == base
+
+
+def test_direct_sync_rolls_back_when_diagnostics_worsen(
+    screen_bot, monkeypatch, tmp_path
+):
+    from editor_adapters import ApplyResult, EditorContext
+    from editor_adapters import sha256_text
+
+    target = tmp_path / "Demo.cs"
+    base = "class Demo\n{\n}\n"
+    target.write_text(base, encoding="utf-8")
+    ctx = EditorContext(
+        file_path=str(target),
+        text=base,
+        language="csharp",
+        dirty=False,
+        source="disk",
+        hash=sha256_text(base),
+        can_apply=True,
+        diagnostics=[],
+    )
+    applied_text = "class Demo\n{\n    int x = 1;\n}\n"
+    calls = {"restore": []}
+
+    monkeypatch.setattr(screen_bot, "_editor_context_for", lambda _t: ctx)
+    monkeypatch.setattr(
+        screen_bot.editor_router,
+        "apply",
+        lambda *a, **k: ApplyResult(
+            ok=True,
+            applied=True,
+            text=applied_text,
+            hash=sha256_text(applied_text),
+            diagnostics=[{"file": str(target), "severity": "error", "message": "boom"}],
+            source="disk",
+        ),
+    )
+
+    def fake_restore(context, original_text, applied_hash=""):
+        calls["restore"].append((original_text, applied_hash))
+        return ApplyResult(ok=True, applied=True, text=original_text, hash=sha256_text(original_text))
+
+    monkeypatch.setattr(screen_bot.editor_router, "restore", fake_restore)
+    reasons = []
+    monkeypatch.setattr(
+        screen_bot,
+        "_queue_pending",
+        lambda ctx, proposed, reason, diagnostics=None: reasons.append(reason),
+    )
+
+    applied = screen_bot._apply_master_direct(target, applied_text)
+
+    assert applied is False
+    assert calls["restore"] == [(base, sha256_text(applied_text))]
+    assert reasons and "diagnostics worsened" in reasons[0]
 
 
 def test_caret_mode_forwards_target_hwnd(screen_bot, monkeypatch):
@@ -201,6 +450,78 @@ def test_caret_mode_forwards_target_hwnd(screen_bot, monkeypatch):
     assert seen["text"].startswith("int x = 1;")
 
 
+def test_bind_refuses_when_foreground_is_not_an_editor(screen_bot, monkeypatch):
+    monkeypatch.setattr(
+        screen_bot.editor_router,
+        "active_window",
+        lambda: (123, "YouTube - Google Chrome", "chrome.exe", "unknown"),
+    )
+    screen_bot.target_file_path = None
+    screen_bot.direct_file_sync = False
+    messages = []
+    monkeypatch.setattr(screen_bot, "_notify_guard", lambda msg: messages.append(msg))
+    monkeypatch.setattr(screen_bot, "play_sound", lambda *a, **k: None)
+
+    assert screen_bot._active_editor_file() is None
+    screen_bot._bind_and_sync_worker()
+
+    assert screen_bot.target_file_path is None
+    assert screen_bot.direct_file_sync is False
+    assert messages and "Nothing was bound or typed" in messages[0]
+
+
+def test_bind_refuses_to_guess_a_non_bridge_ide_path(screen_bot, monkeypatch):
+    monkeypatch.setattr(
+        screen_bot.editor_router,
+        "active_window",
+        lambda: (123, "Demo.cs - IntelliJ IDEA", "idea64.exe", "jetbrains"),
+    )
+    monkeypatch.setattr(
+        screen_bot,
+        "get_or_detect_target_file",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("guessed a path")),
+    )
+    screen_bot.target_file_path = None
+    messages = []
+    monkeypatch.setattr(screen_bot, "_notify_guard", lambda msg: messages.append(msg))
+    monkeypatch.setattr(screen_bot, "play_sound", lambda *a, **k: None)
+
+    assert screen_bot._active_editor_file() is None
+    screen_bot._bind_and_sync_worker()
+
+    assert screen_bot.target_file_path is None
+    assert messages and "target_file_path" in messages[0]
+
+
+def test_bind_uses_the_extension_active_buffer(screen_bot, monkeypatch, tmp_path):
+    from editor_adapters import EditorContext
+    from editor_adapters import sha256_text
+
+    target = tmp_path / "Demo.cs"
+    text = "class Demo\n{\n}\n"
+    target.write_text(text, encoding="utf-8")
+    ctx = EditorContext(
+        file_path=str(target),
+        text=text,
+        language="csharp",
+        dirty=False,
+        source="vscode",
+        hash=sha256_text(text),
+    )
+    monkeypatch.setattr(
+        screen_bot.editor_router,
+        "active_window",
+        lambda: (123, "Demo.cs - Visual Studio Code", "code.exe", "vscode"),
+    )
+    monkeypatch.setattr(
+        screen_bot.editor_router.extension,
+        "get_context",
+        lambda ide, file_path=None: ctx,
+    )
+
+    assert screen_bot._active_editor_file() == target
+
+
 # ---------------------------------------------------------------------------
 # Undo (Ctrl+Alt+Z)
 # ---------------------------------------------------------------------------
@@ -211,6 +532,7 @@ def test_undo_restores_previous_snapshot(screen_bot, monkeypatch, tmp_path):
     new_master = "class Demo\n{\n    int x = 1;\n}\n"
     target.write_text(new_master, encoding="utf-8")
 
+    screen_bot.direct_file_sync = True
     screen_bot.target_file_path = str(target)
     screen_bot.last_code_shadow = new_master
     screen_bot.master_tracker.master_code = old_master
@@ -218,12 +540,44 @@ def test_undo_restores_previous_snapshot(screen_bot, monkeypatch, tmp_path):
     screen_bot.master_tracker.master_code = new_master
 
     monkeypatch.setattr(screen_bot, "get_or_detect_target_file", lambda *a, **k: target)
+    monkeypatch.setattr(
+        screen_bot,
+        "_editor_context_for",
+        lambda t: screen_bot.editor_router.disk.get_context(str(t)),
+    )
 
     screen_bot.trigger_undo()
 
     assert screen_bot.master_tracker.master_code == old_master
     assert screen_bot.last_code_shadow == old_master
     assert target.read_text(encoding="utf-8") == old_master
+
+
+def test_undo_refuses_to_overwrite_newer_user_edits(screen_bot, monkeypatch, tmp_path):
+    target = tmp_path / "Demo.cs"
+    old_master = "class Demo\n{\n}\n"
+    delivered = "class Demo\n{\n    int x = 1;\n}\n"
+    user_edited = delivered + "// my own note\n"
+    target.write_text(user_edited, encoding="utf-8")
+
+    screen_bot.direct_file_sync = True
+    screen_bot.target_file_path = str(target)
+    screen_bot.last_code_shadow = delivered
+    screen_bot.master_tracker.master_code = old_master
+    screen_bot.master_tracker.save_snapshot()
+    screen_bot.master_tracker.master_code = delivered
+
+    monkeypatch.setattr(
+        screen_bot,
+        "_editor_context_for",
+        lambda t: screen_bot.editor_router.disk.get_context(str(t)),
+    )
+
+    assert screen_bot.trigger_undo(quiet=True) is False
+
+    assert target.read_text(encoding="utf-8") == user_edited
+    assert screen_bot.master_tracker.snapshots == [old_master]
+    assert screen_bot.last_code_shadow == delivered
 
 
 # ---------------------------------------------------------------------------

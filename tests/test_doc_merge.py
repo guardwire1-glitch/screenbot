@@ -153,6 +153,15 @@ def test_file_mismatch_and_registry():
     assert r.get("C:\\x\\Main.java") is r.get("main.java") and r.get("a.java") is not r.get("b.java")
 
 
+def test_file_match_ignores_path_and_ocr_casing():
+    # OCR reports the visible tab ("Demo.cs"); the registry stores "demo.cs".
+    # A real frame must not be rejected as file_mismatch because of casing.
+    m = DocMerger("demo.cs")
+    result = m.merge(fr("class Demo\n{\n}"), Meta(file_name="Demo.cs"))
+    assert result.event != "blocked"
+    assert "file_mismatch" not in result.notes
+
+
 def test_allman_csharp_entities():
     cs = "class A\n{\n    void F()\n    {\n    }\n}\nclass B\n{\n}"
     assert [k for k, _, _ in entities(cs.split("\n"))] == ["class A", "class B"]

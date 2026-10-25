@@ -40,3 +40,11 @@ def test_injection_validator_blocks_sentinels():
     valid, reason = validate_code_to_inject("_SB_NO_SELECTION_")
     assert not valid
     assert "sentinel" in reason.lower()
+
+
+def test_structural_only_lines_are_valid_live_payloads():
+    """Closing braces are normal incremental lecture code; the length guard
+    must not reject them as 'too short'."""
+    for payload in ("}", "{", "};", "});"):
+        valid, reason = validate_code_to_inject(payload, subject="csharp")
+        assert valid, (payload, reason)
